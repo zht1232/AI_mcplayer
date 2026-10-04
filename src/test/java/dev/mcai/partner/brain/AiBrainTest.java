@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -121,6 +122,104 @@ class AiBrainTest {
             assertEquals(2, messages.size());
             assertFalse(messages.toString().contains("旧结果"));
         }
+    }
+
+    @Test void serializesThinkingOnAndOffForEachSupportedBackend() throws Exception {
+        for (String protocol : List.of("llama", "template", "qwen", "deepseek", "none")) {
+            for (boolean enabled : List.of(false, true)) {
+                try (AiBrain brain = new AiBrain(new AiBrain.Options(root, "test-model", "", 512, 5,
+                        enabled, protocol), List.of(toolSchema()))) {
+                    brain.request(new JsonObject(), "问候", List.of()).get(5, TimeUnit.SECONDS);
+                }
+                switch (protocol) {
+                    case "llama", "template" -> {
+                        assertEquals(enabled, request.getAsJsonObject("chat_template_kwargs")
+                                .get("enable_thinking").getAsBoolean());
+                        assertFalse(request.has("enable_thinking"));
+                        assertFalse(request.has("thinking"));
+                        if (protocol.equals("llama")) {
+                            assertEquals(enabled ? "medium" : "none", request.get("reasoning_effort").getAsString());
+                        } else {
+                            assertFalse(request.has("reasoning_effort"));
+                        }
+                    }
+                    case "qwen" -> {
+                        assertEquals(enabled, request.get("enable_thinking").getAsBoolean());
+                        assertFalse(request.has("chat_template_kwargs"));
+                        assertFalse(request.has("reasoning_effort"));
+                        assertFalse(request.has("thinking"));
+                    }
+                    case "deepseek" -> {
+                        assertEquals(enabled ? "enabled" : "disabled", request.getAsJsonObject("thinking")
+                                .get("type").getAsString());
+                        assertFalse(request.has("chat_template_kwargs"));
+                        assertFalse(request.has("reasoning_effort"));
+                        assertFalse(request.has("enable_thinking"));
+                    }
+                    case "none" -> assertNoThinkingFields(request);
+                }
+            }
+        }
+        assertEquals(10, requestCount.get());
+    }
+
+    @Test void legacyOptionsDisableThinkingOnLocalAutoProtocol() throws Exception {
+        AiBrain.Options defaults = new AiBrain.Options(root, "test-model", "", 512, 5);
+        assertFalse(defaults.enableThinking());
+        assertEquals("auto", defaults.reasoningProtocol());
+        try (AiBrain brain = new AiBrain(defaults, List.of(toolSchema()))) {
+            brain.request(new JsonObject(), "", List.of()).get(5, TimeUnit.SECONDS);
+        }
+        assertEquals("none", request.get("reasoning_effort").getAsString());
+        assertFalse(request.getAsJsonObject("chat_template_kwargs").get("enable_thinking").getAsBoolean());
+    }
+
+    @Test void autoProtocolRecognizesOnlyKnownHostsAndOmitsUnknownFields() {
+        for (String host : List.of("localhost", "127.0.0.1", "[::1]")) {
+            assertEquals(ReasoningProtocol.LLAMA, ReasoningProtocol.AUTO.resolve(URI.create("http://" + host + ":8080/v1")));
+        }
+        assertEquals(ReasoningProtocol.DEEPSEEK,
+                ReasoningProtocol.AUTO.resolve(URI.create("https://api.deepseek.com/v1")));
+        assertEquals(ReasoningProtocol.QWEN,
+                ReasoningProtocol.AUTO.resolve(URI.create("https://dashscope.aliyuncs.com/compatible-mode/v1")));
+        assertEquals(ReasoningProtocol.QWEN,
+                ReasoningProtocol.AUTO.resolve(URI.create("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")));
+        for (String host : List.of("api.example.com", "deepseek.com.evil.example", "dashscope.aliyuncs.com.evil.example")) {
+            ReasoningProtocol selected = ReasoningProtocol.AUTO.resolve(URI.create("https://" + host + "/v1"));
+            assertEquals(ReasoningProtocol.NONE, selected);
+            for (boolean enabled : List.of(false, true)) {
+                JsonObject body = new JsonObject();
+                body.addProperty("model", "test-model");
+                selected.apply(body, enabled);
+                assertNoThinkingFields(body);
+                assertEquals(1, body.size());
+            }
+        }
+    }
+
+    @Test void validatesProtocolAndNeverTurnsHiddenReasoningIntoSpeech() throws Exception {
+        assertThrows(IllegalArgumentException.class,
+                () -> new AiBrain.Options(root, "model", "", 512, 5, false, "unknown"));
+        assertThrows(IllegalArgumentException.class,
+                () -> new AiBrain.Options(root, "model", "", 512, 5, false, null));
+        assertEquals("template", new AiBrain.Options(root, "model", "", 512, 5,
+                true, " TEMPLATE ").reasoningProtocol());
+        JsonObject envelope = JsonParser.parseString(responseWithSpeech("你好。")).getAsJsonObject();
+        envelope.getAsJsonArray("choices").get(0).getAsJsonObject().getAsJsonObject("message")
+                .addProperty("reasoning_content", "private intermediate reasoning");
+        response = envelope.toString();
+        try (AiBrain brain = brain(root, "")) {
+            AiBrain.Decision decision = brain.request(new JsonObject(), "", List.of()).get(5, TimeUnit.SECONDS);
+            assertEquals("你好。", decision.speech());
+            assertTrue(decision.actions().isEmpty());
+        }
+    }
+
+    private static void assertNoThinkingFields(JsonObject body) {
+        assertFalse(body.has("chat_template_kwargs"));
+        assertFalse(body.has("reasoning_effort"));
+        assertFalse(body.has("enable_thinking"));
+        assertFalse(body.has("thinking"));
     }
 
     @Test void rejectsUnknownToolsMalformedArgumentsAndTooManyCalls() {

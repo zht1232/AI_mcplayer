@@ -11,6 +11,7 @@ import net.minecraft.network.chat.Component;
 import org.lwjgl.glfw.GLFW;
 
 import java.net.URI;
+import dev.mcai.partner.brain.ReasoningProtocol;
 
 /** Local controls; opening this screen suspends AI decisions and movement. */
 public final class PartnerPanel extends Screen {
@@ -25,6 +26,8 @@ public final class PartnerPanel extends Screen {
     private Button enableButton, sendButton, stopButton, autoButton, releaseButton;
     private String goalDraft = "";
     private String endpointDraft, modelDraft, keyDraft;
+    private boolean thinkingDraft;
+    private ReasoningProtocol protocolDraft;
     private String settingsMessage = "";
     private boolean settingsError;
 
@@ -34,6 +37,8 @@ public final class PartnerPanel extends Screen {
         endpointDraft = partner.config().baseUrl;
         modelDraft = partner.config().model;
         keyDraft = partner.config().apiKeyEnv;
+        thinkingDraft = partner.config().enableThinking;
+        protocolDraft = ReasoningProtocol.fromId(partner.config().reasoningProtocol);
     }
 
     @Override protected void init() {
@@ -91,19 +96,35 @@ public final class PartnerPanel extends Screen {
     private void initSettings() {
         endpoint = edit("模型地址", left + 14, bodyTop + 12, innerWidth, 2048, endpointDraft);
         endpoint.setResponder(value -> endpointDraft = value);
-        model = edit("模型名称", left + 14, bodyTop + 46, innerWidth, 256, modelDraft);
+        model = edit("模型名称", left + 14, bodyTop + 42, innerWidth, 256, modelDraft);
         model.setResponder(value -> modelDraft = value);
-        keyEnv = edit("API key 环境变量名", left + 14, bodyTop + 80, innerWidth, 256, keyDraft);
+        keyEnv = edit("API key 环境变量名", left + 14, bodyTop + 72, innerWidth, 256, keyDraft);
         keyEnv.setHint(Component.literal("本地模型留空；API 填环境变量名"));
         keyEnv.setResponder(value -> keyDraft = value);
-        button("保存连接", left + 14, bodyTop + 106, 100, Tone.PRIMARY,
+        int gap = 6;
+        int w = (innerWidth - gap * 3) / 4;
+        int row = bodyTop + 98;
+        button(thinkingDraft ? "推理：开" : "推理：关", left + 14, row, w, Tone.NORMAL,
+                "请求是否开启模型思考；需要后端及模型支持，默认关闭以减少等待", b -> {
+                    thinkingDraft = !thinkingDraft;
+                    b.setMessage(Component.literal(thinkingDraft ? "推理：开" : "推理：关"));
+                });
+        button("协议：" + protocolDraft.label(), left + 14 + w + gap, row, w, Tone.NORMAL,
+                "点击切换：自动、llama.cpp、模板、通义、DeepSeek、无扩展。未知 API 请按服务文档选择", b -> {
+                    var protocols = ReasoningProtocol.values();
+                    protocolDraft = protocols[(protocolDraft.ordinal() + 1) % protocols.length];
+                    b.setMessage(Component.literal("协议：" + protocolDraft.label()));
+                });
+        button("保存连接", left + 14 + (w + gap) * 2, row, w, Tone.PRIMARY,
                 "保存后请回行动页开始接管", b -> saveSettings());
-        button("重载配置", left + 120, bodyTop + 106, 94, Tone.NORMAL,
+        button("重载配置", left + 14 + (w + gap) * 3, row, innerWidth - (w + gap) * 3, Tone.NORMAL,
                 "从当前游戏实例的配置文件重新读取设置", b -> {
                     if (partner.command("reload", "") == 1) {
                         endpointDraft = partner.config().baseUrl;
                         modelDraft = partner.config().model;
                         keyDraft = partner.config().apiKeyEnv;
+                        thinkingDraft = partner.config().enableThinking;
+                        protocolDraft = ReasoningProtocol.fromId(partner.config().reasoningProtocol);
                         settingsMessage = "配置已重载。";
                         settingsError = false;
                         rebuildWidgets();
@@ -147,9 +168,13 @@ public final class PartnerPanel extends Screen {
             if (!environment.isEmpty() && !environment.matches("[A-Za-z_][A-Za-z0-9_]*"))
                 throw new IllegalArgumentException("这里填写环境变量名，例如 MC_AI_API_KEY。");
             if (partner.command("endpoint", address) != 1 || partner.command("model", name) != 1
-                    || partner.command("keyenv", environment) != 1)
-                throw new IllegalStateException("连接保存失败，请查看本地聊天中的详细错误。");
+                    || partner.command("keyenv", environment) != 1
+                    || partner.command("thinking", thinkingDraft ? "on" : "off") != 1
+                    || partner.command("reasoningprotocol", protocolDraft.id()) != 1)
+                throw new IllegalStateException("连接保存失败，请查看行动页的最新反馈。");
             settingsMessage = "已保存，开始接管后使用新连接。";
+            if (protocolDraft.resolve(uri) == ReasoningProtocol.NONE)
+                settingsMessage = "已保存。当前协议不发送推理参数；请按后端文档选择协议。";
             settingsError = false;
         } catch (Exception error) {
             settingsMessage = error.getMessage() == null ? "连接设置无效。" : error.getMessage();
@@ -221,9 +246,9 @@ public final class PartnerPanel extends Screen {
 
     private void renderSettings(GuiGraphicsExtractor graphics) {
         graphics.text(font, "模型地址", left + 14, bodyTop + 1, TEXT, false);
-        graphics.text(font, "模型名称", left + 14, bodyTop + 35, TEXT, false);
-        graphics.text(font, "API key 环境变量名（本地模型可留空）", left + 14, bodyTop + 69, MUTED, false);
-        int messageY = bodyTop + 132;
+        graphics.text(font, "模型名称", left + 14, bodyTop + 31, TEXT, false);
+        graphics.text(font, "API key 环境变量名（本地模型可留空）", left + 14, bodyTop + 61, MUTED, false);
+        int messageY = bodyTop + 126;
         if (footerTop - messageY > 12) {
             String message = settingsMessage.isBlank() ? "地址支持本地服务和兼容 API。API 密钥保存在环境变量中。" : settingsMessage;
             wrapped(graphics, message, left + 14, messageY, innerWidth, Math.max(1, (footerTop - messageY - 6) / 11), settingsError ? ERROR : MUTED);

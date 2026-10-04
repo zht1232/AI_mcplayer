@@ -55,7 +55,12 @@ public final class AiBrain implements AutoCloseable {
             Handle an open menu before attempting world movement.
             """;
 
-    public record Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds) {
+    public record Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds,
+                          boolean enableThinking, String reasoningProtocol) {
+        public Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds) {
+            this(baseUrl, model, apiKeyEnv, maxTokens, timeoutSeconds, false, "auto");
+        }
+
         public Options {
             Objects.requireNonNull(baseUrl, "baseUrl");
             Objects.requireNonNull(model, "model");
@@ -72,6 +77,7 @@ public final class AiBrain implements AutoCloseable {
             if (!apiKeyEnv.isEmpty() && !apiKeyEnv.matches("[A-Za-z_][A-Za-z0-9_]*")) {
                 throw new IllegalArgumentException("apiKeyEnv must be an environment variable name");
             }
+            reasoningProtocol = ReasoningProtocol.fromId(reasoningProtocol).id();
         }
     }
 
@@ -220,6 +226,8 @@ public final class AiBrain implements AutoCloseable {
         body.add("messages", messages);
         body.addProperty("max_tokens", options.maxTokens());
         body.addProperty("stream", false);
+        ReasoningProtocol.fromId(options.reasoningProtocol()).resolve(endpoint)
+                .apply(body, options.enableThinking());
         if (!tools.isEmpty()) {
             body.add("tools", tools.deepCopy());
             body.addProperty("tool_choice", "auto");

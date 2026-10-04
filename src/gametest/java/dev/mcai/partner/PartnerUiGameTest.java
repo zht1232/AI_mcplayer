@@ -163,12 +163,28 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
             context.runOnClient(mc -> {
                 PartnerClient partner = PartnerClient.instance();
                 partner.command("disable", "");
+                partner.config().enableThinking = false;
+                partner.config().reasoningProtocol = "auto";
                 partner.openPanel();
                 mc.gui.toastManager().clear();
             });
             context.takeScreenshot("mc-ai-partner-panel");
             context.clickScreenButton("连接");
+            context.clickScreenButton("推理：关");
+            context.clickScreenButton("协议：自动");
             context.clickScreenButton("保存连接");
+            context.runOnClient(mc -> {
+                try {
+                    var saved = PartnerConfig.load();
+                    check(saved.enableThinking && saved.reasoningProtocol.equals("llama"), "panel did not persist thinking/protocol settings");
+                } catch (java.io.IOException error) { throw new RuntimeException(error); }
+            });
+            context.clickScreenButton("推理：开");
+            context.clickScreenButton("保存连接");
+            context.runOnClient(mc -> {
+                try { check(!PartnerConfig.load().enableThinking, "panel did not persist disabled thinking"); }
+                catch (java.io.IOException error) { throw new RuntimeException(error); }
+            });
             context.takeScreenshot("mc-ai-partner-model-settings");
         }
         context.runOnClient(mc -> check(!PartnerClient.instance().enabled(), "disconnect did not stop AI"));

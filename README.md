@@ -4,11 +4,11 @@ Minecraft **26.2 / Fabric / Java 25** 纯客户端模组。服务器无需安装
 
 ## 安装与开启
 
-1. 在 Fabric 26.2 客户端的 `mods` 文件夹放入 `wildling-0.1.2.jar` 和 `fabric-api-0.161.0+26.2.jar`。
+1. 在 Fabric 26.2 客户端的 `mods` 文件夹放入 `wildling-0.1.3.jar` 和 `fabric-api-0.161.0+26.2.jar`。
    桌面交付实例启用了 PCL 版本隔离，实际目录为 `C:\Users\Administrator\Desktop\MC-AI-Partner\客户端\.minecraft\versions\MC-AI-Partner-Fabric-26.2\mods`；该实例的配置位于同级 `config` 文件夹。启动配置名称不是独立游戏版本，AI 功能由 mod jar 提供。
 2. 启动客户端并正常登录服务器，完成 AuthMe 等登录流程。
 3. 首次启动生成 `config/mc-ai-partner.json`。默认模型端点是 `http://127.0.0.1:8080/v1`，模型名可修改。
-4. 进入服务器后按 **F8** 打开面板，点击“开启 AI”；或输入 `/aip enable`。
+4. 进入服务器后按 **F8** 打开面板，点击“开始接管”；或输入 `/aip enable`。
 
 退出服务器立即停止动作和模型请求，重新进服后需要重新开启。AI 默认自主生存；本地停止命令会同时暂停自主规划。
 
@@ -32,6 +32,8 @@ Minecraft **26.2 / Fabric / Java 25** 纯客户端模组。服务器无需安装
 | `/aip endpoint https://服务地址/v1` | 保存模型端点，随后重新开启 |
 | `/aip model 模型名称` | 保存模型名称，随后重新开启 |
 | `/aip keyenv MC_AI_API_KEY` | 指定保存 API key 的环境变量名称 |
+| `/aip thinking on` / `/aip thinking off` | 保存请求推理开关，随后重新开启 |
+| `/aip reasoningprotocol llama` | 保存推理参数协议；支持 auto/llama/template/qwen/deepseek/none |
 | `/aip reload` | 重载配置 |
 
 所有玩家可在服务器聊天中提到 AI 当前登录的玩家名或 **`@玩家名 <消息>`**，例如 `@AI_Partner 你好`、`AI_Partner 帮我收集木材`；也保留 **`!ai <任务>`**。AI 的自然语言回复通过当前玩家的正常聊天连接发送，服务器上的其他玩家可见；运行状态和错误只显示在本地。公共消息按任务队列处理，本地任务优先；本地任务期间会简短告知消息已排队。`!ai stop`、`@玩家名 停下` 可停止公共/自主任务，不能覆盖正在执行的本地任务。模型自己的聊天回声不会成为新指令。
@@ -48,7 +50,20 @@ API key 放在环境变量中，配置文件仅填写变量名。设置后需从
 
 `scripts/start-model-background.ps1` 可后台启动本地服务，关闭启动窗口不会结束模型；已有 8080 服务时不会重复启动。仓库与 Release 不包含模型和 llama.cpp 大文件，下载后请自行准备模型后端或使用 API。
 
-启动脚本默认开启思考：`--reasoning on --reasoning-budget 256 --reasoning-format deepseek`，保留 32768 上下文。思考通过 `reasoning_content` 独立返回，模组发送到服务器的是正常回复与工具动作。可使用 `-Reasoning off` 关闭，或 `-ReasoningBudget 1024` 修改预算。默认响应预算为 1024 token，请求超时为 120 秒。
+**默认关闭推理**。F8 → 连接页提供“推理：关/开”和协议选择，点击“保存连接”后重新开始接管。配置中的 `enableThinking` 默认为 `false`，`reasoningProtocol` 默认为 `auto`；已有配置缺少新字段时也使用这些默认值。
+
+| 推理协议 | 出站请求设置 |
+|---|---|
+| `auto` 自动 | 本机地址采用 llama，DeepSeek/通义官方域名采用对应协议；其他地址不添加扩展参数 |
+| `llama` llama.cpp | `reasoning_effort: none/medium` 与 `chat_template_kwargs.enable_thinking: false/true` |
+| `template` vLLM/SGLang 模板 | `chat_template_kwargs.enable_thinking: false/true` |
+| `qwen` 通义 API | `enable_thinking: false/true` |
+| `deepseek` DeepSeek | `thinking.type: disabled/enabled` |
+| `none` 不发送 | 后端按自身默认值处理；此选项不会关闭后端思考 |
+
+切换模型时请按服务文档选择协议；局域网部署的 llama.cpp 需手动选择 `llama`。开关需要模型与后端支持，纯推理模型可能不支持关闭。不同协议依据 [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)、[Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/README.md) 和 [DeepSeek](https://api-docs.deepseek.com/guides/thinking_mode/) 的接口定义。
+
+本地启动脚本也默认 `-Reasoning off`，保留原 4B 和 32768 上下文。256 token 预算只限制后续明确开启的思考，不会在关闭时强制生成思考；已验证本机服务可由请求开关切换。处理批次改为 256/128，内存不足可传 `-BatchSize 64 -MicroBatchSize 32`。模组只读取正常回复与工具调用，不把 `reasoning_content` 发到聊天。默认响应预算仍为 1024 token，请求超时仍为 120 秒。
 
 聊天中的 `/tpa`、`/tpaccept` 提示可被观察，`ui_input_chat` 可通过正常客户端接口发送命令。具体传送许可、冷却与结果由服务端现有插件决定；一般聊天建议不能越过本地控制优先级。
 
@@ -73,7 +88,7 @@ flowchart TD
 
 - 请求取消前先使回调版本失效，修复打开 F8 面板时把正常取消误报为 `CancellationException` 的问题。返回游戏后可继续规划。
 - 提到当前玩家名或 `@玩家名` 可进入聊天，回复以正常玩家身份发到服务器。
-- 思考模式默认开启，保留原模型与上下文配置；面板显示模型等待时间和最近错误。
+- 此版曾默认开启思考；0.1.3 改为默认关闭。保留原模型与上下文配置；面板显示模型等待时间和最近错误。
 - 面板拆分为任务状态与模型连接两页，可保存连接设置、使用 Enter 下达任务。
 
 ## 0.1.2 更新
@@ -83,6 +98,11 @@ flowchart TD
 - 去除逐字符颜色和重复富文本，合并重复聊天按钮；普通聊天回复后及时释放公共任务，不再反复问候占队列。
 - 向模型提供最多 8 个由实际碰撞几何计算的附近可达位置，并修复跟随刷新与寻路计时混用的问题。
 - 同一份现场导出数据的观察部分，从旧版 11244 token 降到聊天视图 648、工作视图 2352；不含工具定义和提示词，也不是实际总请求 token。独立本地规划测试中返回了聊天动作和 `move_to`，不代表本服完整自主工作已通过验收。
+
+## 0.1.3 更新
+
+- 默认关闭推理，连接页可选择是否启用和具体请求协议；设置保存到配置，每次规划请求使用当前连接的选项。
+- 增加各协议开关的实际 HTTP 请求测试，以及真实客户端的开关/保存验证。
 
 ## 如何感知环境
 

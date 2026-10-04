@@ -2,6 +2,7 @@ package dev.mcai.partner;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import dev.mcai.partner.brain.ReasoningProtocol;
 import net.fabricmc.loader.api.FabricLoader;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -13,6 +14,8 @@ public final class PartnerConfig {
     public String baseUrl = "http://127.0.0.1:8080/v1";
     public String model = "Qwen3.5-4B";
     public String apiKeyEnv = "";
+    public boolean enableThinking = false;
+    public String reasoningProtocol = "auto";
     public int maxTokens = 1024;
     public int timeoutSeconds = 120;
     public int decisionIntervalSeconds = 2;
@@ -37,6 +40,7 @@ public final class PartnerConfig {
     }
     public void validate() {
         if (baseUrl == null || model == null || model.isBlank()) throw new IllegalArgumentException("模型地址和名称不能为空");
+        reasoningProtocol = ReasoningProtocol.fromId(reasoningProtocol).id();
         if (decisionIntervalSeconds < 2 || decisionIntervalSeconds > 120) throw new IllegalArgumentException("规划间隔应为 2–120 秒");
         if (scanRadius < 2 || scanRadius > 12 || navigationRange < 4 || navigationRange > 64) throw new IllegalArgumentException("扫描/导航范围超出限制");
         if (publicCommandPrefix == null || publicCommandPrefix.isBlank()) throw new IllegalArgumentException("公共指令前缀不能为空");

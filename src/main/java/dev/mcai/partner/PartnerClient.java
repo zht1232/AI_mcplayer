@@ -125,6 +125,8 @@ public final class PartnerClient implements ClientModInitializer {
                 .then(literal("status").executes(ctx -> command("status", "")))
                 .then(literal("inspect").executes(ctx -> command("inspect", "")))
                 .then(literal("reload").executes(ctx -> command("reload", "")))
+                .then(literal("thinking").then(argument("value", StringArgumentType.word()).executes(ctx -> command("thinking", StringArgumentType.getString(ctx, "value")))))
+                .then(literal("reasoningprotocol").then(argument("value", StringArgumentType.word()).executes(ctx -> command("reasoningprotocol", StringArgumentType.getString(ctx, "value")))))
                 .then(literal("model").then(argument("value", StringArgumentType.greedyString()).executes(ctx -> command("model", StringArgumentType.getString(ctx, "value")))))
                 .then(literal("endpoint").then(argument("value", StringArgumentType.greedyString()).executes(ctx -> command("endpoint", StringArgumentType.getString(ctx, "value")))))
                 .then(literal("keyenv").then(argument("value", StringArgumentType.word()).executes(ctx -> command("keyenv", StringArgumentType.getString(ctx, "value")))))
@@ -166,7 +168,8 @@ public final class PartnerClient implements ClientModInitializer {
         requireConnected();
         if (!configurationReady) throw new IllegalStateException("先修复 " + PartnerConfig.path() + " 并用 /aip reload 重载");
         invalidate(); config.validate();
-        brain = new AiBrain(new AiBrain.Options(config.baseUrl, config.model, config.apiKeyEnv, config.maxTokens, config.timeoutSeconds), ToolCatalog.schemas());
+        brain = new AiBrain(new AiBrain.Options(config.baseUrl, config.model, config.apiKeyEnv, config.maxTokens, config.timeoutSeconds,
+                config.enableThinking, config.reasoningProtocol), ToolCatalog.schemas());
         control.enable(); control.autonomous(true); motor.active(true); nextDecision = ticks; lastError = "";
         notice("拾野开始接管。提到或 @" + mc.player.getGameProfile().name() + " 可交流；本地控制优先。");
     }
@@ -404,6 +407,15 @@ public final class PartnerClient implements ClientModInitializer {
                     Files.writeString(file, new GsonBuilder().setPrettyPrinting().create().toJson(observation()), StandardCharsets.UTF_8); notice("观察数据已写入 " + file);
                 }
                 case "reload" -> { boolean wasEnabled = control.enabled(); disable(); configurationReady = false; config = PartnerConfig.load(); configurationReady = true; motor = new ClientMotor(mc, config.navigationRange); if (wasEnabled) enable(); notice("配置已重载。"); }
+                case "thinking", "reasoningprotocol" -> {
+                    if (command.equals("thinking") && !value.equals("on") && !value.equals("off"))
+                        throw new IllegalArgumentException("推理开关使用 on 或 off");
+                    if (command.equals("reasoningprotocol")) dev.mcai.partner.brain.ReasoningProtocol.fromId(value);
+                    disable();
+                    if (command.equals("thinking")) config.enableThinking = value.equals("on");
+                    else config.reasoningProtocol = value;
+                    config.save(); notice("推理设置已保存，开始接管后生效。");
+                }
                 case "model", "endpoint", "keyenv" -> {
                     disable(); if (command.equals("model")) config.model = value; else if (command.equals("endpoint")) config.baseUrl = value; else config.apiKeyEnv = value;
                     config.save(); notice("连接设置已保存，开始接管后生效。");

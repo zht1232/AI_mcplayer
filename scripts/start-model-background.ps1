@@ -1,11 +1,14 @@
-param([string]$ModelPath)
+param(
+    [string]$ModelPath,
+    [ValidateSet('on', 'off', 'auto')][string]$Reasoning = 'off'
+)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $listening = Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue
 if ($listening) { Write-Output 'A service is already listening on port 8080. No duplicate model process was started.'; exit 0 }
 $launcher = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $script = Join-Path $PSScriptRoot 'start-model.ps1'
-$arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script + '"'
+$arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Reasoning ' + $Reasoning
 if ($ModelPath) {
     $model = Get-Item -LiteralPath $ModelPath -ErrorAction Stop
     $arguments += ' -ModelPath "' + $model.FullName + '"'
