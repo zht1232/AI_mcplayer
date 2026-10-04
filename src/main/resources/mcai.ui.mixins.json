@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "dev.mcai.partner.mixin.ui",
+  "compatibilityLevel": "JAVA_25",
+  "client": ["HudAccessor", "BossOverlayAccessor", "TabOverlayAccessor", "DialogScreenAccessor", "SliderAccessor"],
+  "injectors": { "defaultRequire": 1 }
+}

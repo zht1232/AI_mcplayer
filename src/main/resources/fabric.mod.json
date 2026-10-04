@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "mc_ai_partner",
+  "version": "${version}",
+  "name": "MC AI Partner",
+  "description": "Minecraft 26.2 客户端 AI 生存队友，带服务器菜单与 HUD 感知。",
+  "environment": "client",
+  "entrypoints": { "client": ["dev.mcai.partner.PartnerClient"] },
+  "mixins": ["mcai.ui.mixins.json", "mcai.motor.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

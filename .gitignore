@@ -1,0 +1,16 @@
+.gradle/
+.tools/
+build/
+run/
+.idea/
+*.iml
+repos/
+model/
+llamacpp/
+*.log
+ops-manual/
+scripts/baseline_before.json
+scripts/baseline_test.py
+scripts/启动LLM服务.bat
+replay_pid*
+hs_err_pid*
