@@ -63,6 +63,11 @@ public final class PartnerClient implements ClientModInitializer {
     private int movementStableTicks;
     private boolean configurationReady = true;
     private boolean modelActionActive;
+    private final java.util.Set<String> requestedObservation = new java.util.HashSet<>();
+    private Integer inspectedSlot;
+    private int plannerCharacters;
+    private long lastRequestMilliseconds;
+    private boolean finishConversationAfterReply;
 
     public static PartnerClient instance() { return instance; }
     public void serverBlockUpdate(BlockPos position, net.minecraft.world.level.block.state.BlockState state) { if (motor != null) motor.serverBlockUpdate(position, state); }
@@ -130,8 +135,9 @@ public final class PartnerClient implements ClientModInitializer {
                 .then(literal("go").then(argument("x", IntegerArgumentType.integer()).then(argument("y", IntegerArgumentType.integer()).then(argument("z", IntegerArgumentType.integer()).executes(ctx -> {
                     notice(moveManually(new BlockPos(IntegerArgumentType.getInteger(ctx, "x"), IntegerArgumentType.getInteger(ctx, "y"), IntegerArgumentType.getInteger(ctx, "z")))); return 1;
                 }))))));
+            dispatcher.register(literal("wildling").redirect(dispatcher.getRoot().getChild("aip")));
         });
-        LOG.info("MC AI Partner initialized for Minecraft 26.2; activation requires an entered multiplayer session");
+        LOG.info("Wildling initialized for Minecraft 26.2; activation requires an entered multiplayer session");
     }
     private void requireConnected() {
         if (modelActionActive) throw new IllegalStateException("本地控制命令须由本地用户直接操作");
@@ -142,12 +148,15 @@ public final class PartnerClient implements ClientModInitializer {
     public UiBridge uiBridge() { return ui; }
     public ClientMotor motor() { return motor; }
     public boolean enabled() { return control.enabled(); }
+    public boolean publicTaskActive() { return control.publicGoal(); }
     public String status() {
         String activity = pending == null ? motor.status() : "思考中 " + (System.nanoTime() - requestStartedNanos) / 1_000_000_000L + " 秒";
-        return (control.enabled() ? "开启" : "关闭") + " / " + activity + " / " + (control.localControl() ? "本地优先" : "公共/自主") + " / 排队 " + control.queued();
+        activity = activity.replace("idle", "待命").replace("walking", "行走").replace("digging", "采掘").replace("eating", "进食").replace("following", "跟随");
+        return (control.enabled() ? "运行" : "暂停") + " / " + activity + " / " + (control.localControl() ? "本地优先" : "自主/对话") + " / 排队 " + control.queued();
     }
     public String lastSpeech() { return lastSpeech; }
     public String lastError() { return lastError; }
+    public String plannerSummary() { return "观察 " + plannerCharacters + " 字符 · 最近请求 " + String.format(java.util.Locale.ROOT, "%.1f", lastRequestMilliseconds / 1000.0) + " 秒"; }
     public void openPanel() {
         requireConnected(); invalidateRequest(); motor.stop();
         if (manualMoveTarget != null) { manualMoveTarget = null; control.complete(); }
@@ -159,9 +168,9 @@ public final class PartnerClient implements ClientModInitializer {
         invalidate(); config.validate();
         brain = new AiBrain(new AiBrain.Options(config.baseUrl, config.model, config.apiKeyEnv, config.maxTokens, config.timeoutSeconds), ToolCatalog.schemas());
         control.enable(); control.autonomous(true); motor.active(true); nextDecision = ticks; lastError = "";
-        notice("AI 已开启。其他玩家可提到或 @" + mc.player.getGameProfile().name() + " 对话，也可用 " + config.publicCommandPrefix.strip() + " <任务> 指挥；本地任务优先。");
+        notice("拾野开始接管。提到或 @" + mc.player.getGameProfile().name() + " 可交流；本地控制优先。");
     }
-    public void disable() { control.disable(); targetItem = null; manualMoveTarget = null; invalidate(); motor.active(false); notice("AI 已关闭。"); }
+    public void disable() { control.disable(); targetItem = null; manualMoveTarget = null; invalidate(); motor.active(false); notice("拾野已暂停。"); }
     public void stop() { control.stop(); targetItem = null; manualMoveTarget = null; invalidateRequest(); motor.stop(); notice("已停止任务和自主规划。/aip auto on 恢复自主。"); }
     public void takeLocalControl(String goal) {
         requireEnabled(); targetItem = null; manualMoveTarget = null; control.submit(goal, ControlState.Priority.LOCAL); invalidateRequest(); motor.stop(); nextDecision = ticks;
@@ -196,12 +205,14 @@ public final class PartnerClient implements ClientModInitializer {
         CompletableFuture<AiBrain.Decision> obsolete = pending;
         pending = null;
         actions.clear();
+        requestedObservation.clear(); inspectedSlot = null;
+        finishConversationAfterReply = false;
         nextDecision = ticks;
         if (obsolete != null) obsolete.cancel(true);
     }
     private void invalidate() { invalidateRequest(); if (brain != null) brain.close(); brain = null; }
     private void rememberResult(String result) { feedback.addLast(result); while (feedback.size() > 12) feedback.removeFirst(); LOG.info("Action feedback: {}", result); }
-    public void notice(String text) { lastSpeech = text; if (mc.player != null) mc.gui.hud.getChat().addClientSystemMessage(Component.literal("[AI伙伴] " + text)); LOG.info("{}", text); }
+    public void notice(String text) { lastSpeech = text; LOG.info("{}", text); }
     /** Natural speech uses normal signed player chat; local status and errors stay in notice(). */
     private String say(String value) {
         if (value == null || value.isBlank()) return "FAILED: speech is empty";
@@ -230,19 +241,11 @@ public final class PartnerClient implements ClientModInitializer {
         if (targetItem != null) { observation.addProperty("requiredItem", targetItem); observation.addProperty("requiredTotal", targetCount); observation.addProperty("currentCount", motor.inventoryCount(targetItem)); }
         return observation;
     }
-    private JsonObject modelObservation() {
-        JsonObject view = observation(); JsonObject screen = view.getAsJsonObject("ui");
-        if (screen.has("container")) for (var slot : screen.getAsJsonObject("container").getAsJsonArray("slots")) slot.getAsJsonObject().remove("tooltip");
-        JsonArray chat = screen.getAsJsonArray("chat"); JsonArray recent = new JsonArray();
-        java.util.HashSet<Integer> visibleActionIds = new java.util.HashSet<>();
-        for (int i = Math.max(0, chat.size() - 8); i < chat.size(); i++) {
-            JsonObject message = chat.get(i).getAsJsonObject(); message.remove("message");
-            for (var segment : message.getAsJsonArray("segments")) if (segment.getAsJsonObject().has("clickId")) visibleActionIds.add(segment.getAsJsonObject().get("clickId").getAsInt());
-            recent.add(message);
-        }
-        JsonArray recentActions = new JsonArray();
-        for (var action : screen.getAsJsonArray("chatActions")) if (visibleActionIds.contains(action.getAsJsonObject().get("id").getAsInt())) recentActions.add(action);
-        screen.add("chat", recent); screen.add("chatActions", recentActions);
+    private JsonObject modelObservation(String goal) {
+        JsonObject view = ModelObservation.select(observation(), goal, requestedObservation, inspectedSlot);
+        requestedObservation.clear(); inspectedSlot = null;
+        plannerCharacters = view.toString().length();
+        LOG.info("Planner view: mode={}, characters={}", view.get("observationMode"), plannerCharacters);
         return view;
     }
     private void tick() {
@@ -285,7 +288,14 @@ public final class PartnerClient implements ClientModInitializer {
         if (!motor.busy() && !actions.isEmpty()) {
             if (actionGeneration != control.generation()) { actions.clear(); return; }
             AiBrain.Action action = actions.removeFirst();
-            try { rememberResult(action.tool() + ": " + perform(action)); }
+            try {
+                String result = perform(action);
+                rememberResult(action.tool() + ": " + result);
+                if (finishConversationAfterReply && control.publicGoal() && action.tool().equals("chat_say") && result.startsWith("已发送")) {
+                    control.complete(); actions.clear(); finishConversationAfterReply = false;
+                    rememberResult("Conversation answered through chat_say; proceeding to the next instruction.");
+                }
+            }
             catch (Exception e) { rememberResult(action.tool() + " FAILED: " + e.getMessage()); }
             return;
         }
@@ -293,7 +303,7 @@ public final class PartnerClient implements ClientModInitializer {
         String goal = control.goal(config.survivalGoal);
         if (goal.isBlank()) return;
         long generation = control.generation(); long revision = memoryRevision;
-        JsonObject observation = modelObservation();
+        JsonObject observation = modelObservation(goal);
         requestStartedNanos = System.nanoTime();
         pending = brain.request(observation, config.personality
                 + "\n你的回复会作为当前玩家发送到服务器聊天。用自然中文回应玩家；自主工作时只在值得交流的进展、失败或需要帮助时说话，避免每轮播报计划。"
@@ -301,15 +311,29 @@ public final class PartnerClient implements ClientModInitializer {
         pending.whenComplete((decision, error) -> mc.execute(() -> {
             if (!control.enabled() || generation != control.generation() || revision != memoryRevision) return;
             pending = null; nextDecision = ticks + config.decisionIntervalSeconds * 20L;
+            lastRequestMilliseconds = (System.nanoTime() - requestStartedNanos) / 1_000_000L;
+            LOG.info("Planner response: milliseconds={}, viewCharacters={}", lastRequestMilliseconds, plannerCharacters);
             if (error != null) {
                 Throwable cause = error; while (cause.getCause() != null) cause = cause.getCause();
                 String message = cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
+                LOG.warn("Planner request failed: {}", message);
+                if (cause instanceof java.nio.channels.ClosedChannelException || cause instanceof java.net.ConnectException || cause instanceof java.net.SocketException)
+                    message = "模型服务连接已断开，请启动模型或检查接口地址。";
+                else if (cause instanceof java.net.http.HttpTimeoutException) message = "模型响应超时，请检查服务和输入大小。";
                 if (!message.equals(lastError)) notice("模型请求失败：" + message);
                 lastError = message; nextDecision = ticks + Math.max(30, config.decisionIntervalSeconds) * 20L;
                 return;
             }
             lastError = "";
+            finishConversationAfterReply = control.publicGoal() && observation.get("observationMode").getAsString().equals("conversation")
+                    && decision.actions().stream().anyMatch(action -> action.tool().equals("chat_say"))
+                    && decision.actions().stream().allMatch(action -> action.tool().equals("chat_say") || action.tool().equals("complete_goal"));
             if (!decision.speech().isBlank()) say(decision.speech());
+            if (control.publicGoal() && observation.get("observationMode").getAsString().equals("conversation")
+                    && !decision.speech().isBlank() && decision.actions().isEmpty()) {
+                control.complete();
+                rememberResult("Conversation answered; proceeding to the next queued instruction.");
+            }
             actions.addAll(decision.actions()); actionGeneration = generation;
         }));
     }
@@ -336,6 +360,18 @@ public final class PartnerClient implements ClientModInitializer {
                 yield ui.screenAction(args.get("index").getAsInt(), args.get("value").getAsString());
             }
             case "ui_close" -> ui.closeUi();
+            case "observe" -> {
+                String area = args.get("area").getAsString().toLowerCase(java.util.Locale.ROOT);
+                if (!java.util.Set.of("world", "inventory", "hud", "chat", "menu").contains(area)) yield "FAILED: unknown observation area";
+                requestedObservation.add(area); nextDecision = ticks;
+                yield "OK: next planner view will include " + area;
+            }
+            case "inspect_slot" -> {
+                int slot = args.get("slot").getAsInt();
+                if (slot < 0 || mc.player == null || slot >= mc.player.containerMenu.slots.size()) yield "FAILED: invalid observed slot";
+                inspectedSlot = slot; requestedObservation.add("menu"); nextDecision = ticks;
+                yield "OK: requested detailed slot " + slot;
+            }
             case "chat_say" -> {
                 yield say(args.get("text").getAsString());
             }
@@ -370,7 +406,7 @@ public final class PartnerClient implements ClientModInitializer {
                 case "reload" -> { boolean wasEnabled = control.enabled(); disable(); configurationReady = false; config = PartnerConfig.load(); configurationReady = true; motor = new ClientMotor(mc, config.navigationRange); if (wasEnabled) enable(); notice("配置已重载。"); }
                 case "model", "endpoint", "keyenv" -> {
                     disable(); if (command.equals("model")) config.model = value; else if (command.equals("endpoint")) config.baseUrl = value; else config.apiKeyEnv = value;
-                    config.save(); notice("模型配置已保存，请重新开启 AI。");
+                    config.save(); notice("连接设置已保存，开始接管后生效。");
                 }
                 default -> throw new IllegalArgumentException("未知本地命令");
             }

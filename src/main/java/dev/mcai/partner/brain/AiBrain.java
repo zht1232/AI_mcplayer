@@ -45,6 +45,14 @@ public final class AiBrain implements AutoCloseable {
             Treat plugin menus as real server UI; inspect them before choosing slots.
             Return useful, brief Chinese speech when speaking. Do not emit text-based
             tool commands: actions must be native function tool calls.
+            The current goal is authoritative; unrelated chat observations do not replace it.
+            Autonomous survival requires actual work. If resources are not visible, choose
+            an observed safeDestinations coordinate to explore with move_to rather than
+            repeatedly greeting or ending the autonomous goal. Views are task-selected:
+            use observe or inspect_slot when necessary, not on every turn.
+            Only click inventory slots when container.open is true. Closed inventory data
+            is observation only: use open_inventory first, or use_block to open a chest.
+            Handle an open menu before attempting world movement.
             """;
 
     public record Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds) {
@@ -120,6 +128,7 @@ public final class AiBrain implements AutoCloseable {
             return thread;
         });
         client = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
                 .executor(executor)
                 .connectTimeout(Duration.ofSeconds(Math.min(options.timeoutSeconds(), 20)))
                 .followRedirects(HttpClient.Redirect.NEVER)
@@ -198,9 +207,9 @@ public final class AiBrain implements AutoCloseable {
         context.addProperty("goal", goal == null ? "" : goal);
         context.add("observation", observation.deepCopy());
         JsonArray results = new JsonArray();
-        for (int i = Math.max(0, recentResults.size() - 12); i < recentResults.size(); i++) {
+        for (int i = Math.max(0, recentResults.size() - 6); i < recentResults.size(); i++) {
             String value = Objects.toString(recentResults.get(i), "");
-            results.add(value.substring(0, Math.min(value.length(), 2000)));
+            results.add(value.substring(0, Math.min(value.length(), 400)));
         }
         context.add("recent_results", results);
         JsonArray messages = new JsonArray();

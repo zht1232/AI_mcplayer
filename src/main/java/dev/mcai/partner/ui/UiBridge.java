@@ -301,7 +301,7 @@ public final class UiBridge {
     }
     private boolean localCommand(String text) {
         String value = text.strip().toLowerCase(Locale.ROOT);
-        return value.equals("/aip") || value.startsWith("/aip ");
+        return value.equals("/aip") || value.startsWith("/aip ") || value.equals("/wildling") || value.startsWith("/wildling ");
     }
 
     public String closeUi() {

@@ -42,6 +42,8 @@ public final class ToolCatalog {
         tools.add(tool("wait", "Observe server feedback while no physical task runs; seconds 1–30.", "seconds:integer"));
         tools.add(tool("complete_goal", "Finish an explicit goal only after its postcondition is visible. Explain the evidence.", "evidence:string"));
         tools.add(tool("remember", "Persist a short useful fact about the current server, capped to avoid unlimited memory.", "text:string"));
+        tools.add(tool("observe", "Request additional data for the next decision: world, inventory, hud, chat, or menu. Use only when the current task-selected view lacks needed information.", "area:string"));
+        tools.add(tool("inspect_slot", "Request detailed name, lore and item data for one currently observed container slot.", "slot:integer"));
         return tools;
     }
 }

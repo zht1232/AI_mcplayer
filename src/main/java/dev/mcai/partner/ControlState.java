@@ -42,6 +42,7 @@ public final class ControlState {
     public boolean enabled() { return enabled; }
     public boolean autonomous() { return autonomous; }
     public boolean localControl() { return current != null && current.priority == Priority.LOCAL; }
+    public boolean publicGoal() { return current != null && current.priority == Priority.PUBLIC; }
     public String goal(String fallback) { return current == null ? (autonomous ? fallback : "") : current.text; }
     public long generation() { return generation; }
     public int queued() { return queue.size(); }

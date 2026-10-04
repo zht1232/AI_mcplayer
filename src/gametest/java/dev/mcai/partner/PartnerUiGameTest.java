@@ -133,13 +133,23 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                 var score = mcServer.getScoreboard().getPlayerScoreInfo(connection.getServerPlayer(), mcServer.getScoreboard().getObjective("mc_ai_dialog"));
                 check(score != null && score.value() == 1, "Dialog click did not execute the server action");
             });
-            testPanelCancellation(context);
+            testPanelCancellation(context, server, connection);
             context.runOnClient(mc -> {
                 PartnerClient partner = PartnerClient.instance();
                 check(partner.command("enable", "") == 1, "entered multiplayer session should allow activation");
                 partner.command("auto", "off"); // Same client task; no decision tick and no model request.
             });
-            BlockPos destination = context.computeOnClient(mc -> mc.player.blockPosition().offset(3, 0, 0));
+            context.runOnClient(mc -> PartnerClient.instance().motor().follow("MissingFollowTarget"));
+            context.waitFor(mc -> !PartnerClient.instance().motor().busy(), 50);
+            // The model must have a genuine movement choice on a plain field with no
+            // interesting resource blocks. Walk to one of the actual supplied positions.
+            BlockPos destination = context.computeOnClient(mc -> {
+                var positions = PartnerClient.instance().motor().snapshot(6).getAsJsonArray("safeDestinations");
+                check(!positions.isEmpty() && positions.size() <= 8, "plain terrain must expose bounded safe walking choices");
+                JsonObject position = positions.get(0).getAsJsonObject();
+                check(position.get("distance").getAsDouble() >= 1.5 && position.get("pathSteps").getAsInt() > 0, "walking choice must actually leave current position");
+                return new BlockPos(position.get("x").getAsInt(), position.get("y").getAsInt(), position.get("z").getAsInt());
+            });
             context.runOnClient(mc -> check(PartnerClient.instance().moveManually(destination).startsWith("STARTED"), "short safe movement failed to plan"));
             context.waitFor(mc -> mc.player.position().distanceTo(new net.minecraft.world.phys.Vec3(destination.getX() + .5, destination.getY(), destination.getZ() + .5)) < .7, 180);
             context.waitTicks(25); connection.waitForServerboundPackets();
@@ -157,7 +167,7 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                 mc.gui.toastManager().clear();
             });
             context.takeScreenshot("mc-ai-partner-panel");
-            context.clickScreenButton("模型连接");
+            context.clickScreenButton("连接");
             context.clickScreenButton("保存连接");
             context.takeScreenshot("mc-ai-partner-model-settings");
         }
@@ -165,7 +175,7 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
     }
 
     /** A delayed local mock lets cancel() exercise the real inline client callback. */
-    private void testPanelCancellation(ClientGameTestContext context) {
+    private void testPanelCancellation(ClientGameTestContext context, TestDedicatedServerContext server, TestDedicatedServerConnection connection) {
         CountDownLatch firstStarted = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);
         AtomicInteger requests = new AtomicInteger();
@@ -175,13 +185,19 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
             HttpServer model = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
             model.setExecutor(executor);
             model.createContext("/v1/chat/completions", exchange -> {
-                exchange.getRequestBody().readAllBytes();
+                String requestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 if (requests.incrementAndGet() == 1) {
                     firstStarted.countDown();
                     try { releaseFirst.await(15, TimeUnit.SECONDS); }
                     catch (InterruptedException exception) { Thread.currentThread().interrupt(); }
                 }
-                byte[] response = "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"PANEL_REPLAN_OK\"}}]}".getBytes(StandardCharsets.UTF_8);
+                JsonObject payload = com.google.gson.JsonParser.parseString(requestBody).getAsJsonObject();
+                JsonObject input = com.google.gson.JsonParser.parseString(payload.getAsJsonArray("messages").get(1).getAsJsonObject().get("content").getAsString()).getAsJsonObject();
+                boolean chatOnly = input.get("goal").getAsString().contains("__chat_tool_case__");
+                String json = chatOnly
+                        ? "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"chat_say\",\"arguments\":\"{\\\"text\\\":\\\"CHAT_TOOL_ONLY_OK\\\"}\"}}]}}]}"
+                        : "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"PANEL_REPLAN_OK\"}}]}";
+                byte[] response = json.getBytes(StandardCharsets.UTF_8);
                 try {
                     exchange.getResponseHeaders().add("Content-Type", "application/json");
                     exchange.sendResponseHeaders(200, response.length);
@@ -212,6 +228,11 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                 context.waitFor(mc -> PartnerClient.instance().uiBridge().snapshot().getAsJsonArray("chat")
                         .toString().contains("PANEL_REPLAN_OK"), 100);
                 context.runOnClient(mc -> check(PartnerClient.instance().lastError().isEmpty(), "replanning failed after panel cancellation"));
+                context.waitTicks(50);
+                server.runOnServer(mcServer -> connection.getServerPlayer().sendSystemMessage(Component.literal("Guest: @" + connection.getServerPlayer().getGameProfile().name() + " __chat_tool_case__")));
+                connection.waitForClientboundPackets();
+                context.waitFor(mc -> PartnerClient.instance().lastSpeech().equals("CHAT_TOOL_ONLY_OK"), 150);
+                context.runOnClient(mc -> check(!PartnerClient.instance().publicTaskActive(), "chat_say-only reply kept its public task active"));
             } finally {
                 releaseFirst.countDown();
                 context.runOnClient(mc -> {

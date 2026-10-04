@@ -16,7 +16,7 @@ import java.net.URI;
 public final class PartnerPanel extends Screen {
     private static final int TEXT = 0xFFEAF1F7;
     private static final int MUTED = 0xFF9CAFBF;
-    private static final int ACCENT = 0xFF65D9C0;
+    private static final int ACCENT = 0xFFE2BF83;
     private static final int ERROR = 0xFFFFA29C;
     private final PartnerClient partner;
     private boolean settings;
@@ -29,7 +29,7 @@ public final class PartnerPanel extends Screen {
     private boolean settingsError;
 
     public PartnerPanel(PartnerClient partner) {
-        super(Component.literal("AI 生存伙伴"));
+        super(Component.literal("拾野 · Wildling"));
         this.partner = partner;
         endpointDraft = partner.config().baseUrl;
         modelDraft = partner.config().model;
@@ -47,16 +47,16 @@ public final class PartnerPanel extends Screen {
         goal = endpoint = model = keyEnv = null;
         enableButton = sendButton = stopButton = autoButton = releaseButton = null;
 
-        button("任务与状态", left + 14, top + 43, 94, settings ? Tone.NORMAL : Tone.SELECTED,
+        button("行动", left + 14, top + 43, 94, settings ? Tone.NORMAL : Tone.SELECTED,
                 "下达本地任务、管理自主生存、查看运行状态", b -> switchTab(false));
-        button("模型连接", left + 114, top + 43, 94, settings ? Tone.SELECTED : Tone.NORMAL,
+        button("连接", left + 114, top + 43, 94, settings ? Tone.SELECTED : Tone.NORMAL,
                 "编辑本地模型或 API 的连接地址", b -> switchTab(true));
         if (settings) initSettings(); else initDashboard();
 
         button("导出观察", left + panelWidth - 202, footerTop, 90, Tone.NORMAL,
                 "导出服务器 UI 与世界观察数据，方便定位菜单问题", b -> partner.command("inspect", ""));
         button("返回游戏", left + panelWidth - 106, footerTop, 92, Tone.NORMAL,
-                "关闭面板；已开启的 AI 会继续工作", b -> onClose());
+                "关闭面板，继续当前行动", b -> onClose());
         if (!settings) setInitialFocus(goal);
     }
 
@@ -71,7 +71,7 @@ public final class PartnerPanel extends Screen {
         int gap = 6;
         int buttonWidth = (innerWidth - gap * 3) / 4;
         int row = bodyTop + 48;
-        enableButton = button(partner.enabled() ? "关闭 AI" : "开启 AI", left + 14, row, buttonWidth,
+        enableButton = button(partner.enabled() ? "暂停接管" : "开始接管", left + 14, row, buttonWidth,
                 Tone.PRIMARY, "控制当前登录账号；退出服务器自动关闭", b -> {
                     partner.command(partner.enabled() ? "disable" : "enable", "");
                     refreshAvailability();
@@ -97,7 +97,7 @@ public final class PartnerPanel extends Screen {
         keyEnv.setHint(Component.literal("本地模型留空；API 填环境变量名"));
         keyEnv.setResponder(value -> keyDraft = value);
         button("保存连接", left + 14, bodyTop + 106, 100, Tone.PRIMARY,
-                "保存后请回任务页重新开启 AI", b -> saveSettings());
+                "保存后请回行动页开始接管", b -> saveSettings());
         button("重载配置", left + 120, bodyTop + 106, 94, Tone.NORMAL,
                 "从当前游戏实例的配置文件重新读取设置", b -> {
                     if (partner.command("reload", "") == 1) {
@@ -149,7 +149,7 @@ public final class PartnerPanel extends Screen {
             if (partner.command("endpoint", address) != 1 || partner.command("model", name) != 1
                     || partner.command("keyenv", environment) != 1)
                 throw new IllegalStateException("连接保存失败，请查看本地聊天中的详细错误。");
-            settingsMessage = "已保存。回任务页开启 AI 后使用新连接。";
+            settingsMessage = "已保存，开始接管后使用新连接。";
             settingsError = false;
         } catch (Exception error) {
             settingsMessage = error.getMessage() == null ? "连接设置无效。" : error.getMessage();
@@ -159,7 +159,7 @@ public final class PartnerPanel extends Screen {
 
     private void refreshAvailability() {
         if (enableButton == null) return;
-        enableButton.setMessage(Component.literal(partner.enabled() ? "关闭 AI" : "开启 AI"));
+        enableButton.setMessage(Component.literal(partner.enabled() ? "暂停接管" : "开始接管"));
         sendButton.active = partner.enabled() && goal != null && !goal.getValue().isBlank();
         stopButton.active = autoButton.active = releaseButton.active = partner.enabled();
     }
@@ -183,13 +183,14 @@ public final class PartnerPanel extends Screen {
         graphics.fill(left + 3, top + 4, left + panelWidth + 3, top + panelHeight + 4, 0x66000000);
         graphics.fillGradient(left, top, left + panelWidth, top + panelHeight, 0xF51D2B37, 0xF513202B);
         graphics.fill(left, top, left + panelWidth, top + 2, ACCENT);
-        graphics.text(font, "AI 生存伙伴", left + 14, top + 13, TEXT, false);
+        graphics.text(font, "拾野", left + 14, top + 13, ACCENT, false);
+        graphics.text(font, "WILDLING", left + 46, top + 13, MUTED, false);
         String playerName = minecraft.player == null ? "未登录" : minecraft.player.getGameProfile().name();
         String subtitle = settings && !settingsMessage.isBlank() ? settingsMessage : "当前账号  " + playerName + "  ·  本地控制优先";
         graphics.text(font, fit(subtitle, innerWidth - 86), left + 14, top + 28, settings && settingsError ? ERROR : MUTED, false);
         int chipX = left + panelWidth - 80;
         graphics.fill(chipX, top + 13, left + panelWidth - 14, top + 31, partner.enabled() ? 0xFF254F47 : 0xFF304151);
-        graphics.text(font, partner.enabled() ? "AI 已开启" : "AI 未开启", chipX + 7, top + 18, partner.enabled() ? ACCENT : MUTED, false);
+        graphics.text(font, partner.enabled() ? "接管中" : "待命", chipX + 7, top + 18, partner.enabled() ? ACCENT : MUTED, false);
 
         if (settings) renderSettings(graphics); else renderDashboard(graphics);
         graphics.fill(left + 14, footerTop - 5, left + panelWidth - 14, footerTop - 4, 0xFF324452);
@@ -199,7 +200,7 @@ public final class PartnerPanel extends Screen {
     }
 
     private void renderDashboard(GuiGraphicsExtractor graphics) {
-        graphics.text(font, "给伙伴安排任务", left + 14, bodyTop + 2, TEXT, false);
+        graphics.text(font, "下一步做什么", left + 14, bodyTop + 2, TEXT, false);
         int cardTop = bodyTop + 76;
         int cardBottom = footerTop - 10;
         graphics.fill(left + 14, cardTop, left + panelWidth - 14, cardBottom, 0xFF101C26);
@@ -209,7 +210,7 @@ public final class PartnerPanel extends Screen {
         int cursor = wrapped(graphics, partner.status(), textX, cardTop + 20, textWidth,
                 cardBottom - cardTop > 80 ? 2 : 1, TEXT);
         if (cardBottom - cursor > 36) {
-            graphics.text(font, fit("模型  " + partner.config().model, textWidth), textX, cursor + 6, ACCENT, false);
+            graphics.text(font, fit(partner.plannerSummary(), textWidth), textX, cursor + 6, ACCENT, false);
             cursor += 21;
         }
         String error = partner.lastError();

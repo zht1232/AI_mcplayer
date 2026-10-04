@@ -41,6 +41,7 @@ public final class ClientMotor {
     private int eatingTicks;
     private int restoreSlot = -1;
     private String following;
+    private int followTicks;
     private UUID collecting;
     private boolean active;
     private Vec3 destination;
@@ -64,7 +65,7 @@ public final class ClientMotor {
     public List<String> drainResults() { List<String> values = List.copyOf(results); results.clear(); return values; }
     public void stop() {
         route.clear(); destination = null; digging = null; diggingConfirmed = null; following = null; collecting = null;
-        eatingTicks = 0; taskTicks = 0; stillTicks = 0;
+        eatingTicks = 0; taskTicks = 0; stillTicks = 0; followTicks = 0;
         if (mc.gameMode != null) { mc.gameMode.stopDestroyBlock(); if (mc.player != null && mc.player.isUsingItem()) mc.gameMode.releaseUsingItem(mc.player); }
         restoreFoodSlot(); releaseKeys();
     }
@@ -96,7 +97,10 @@ public final class ClientMotor {
                 floor.getX() + .5 + width, height + mc.player.getBbHeight(), floor.getZ() + .5 + width);
         if (!mc.level.noCollision(mc.player, box)) return null;
         BlockPos feet = BlockPos.containing(floor.getX() + .5, height + .01, floor.getZ() + .5);
-        if (hazard(mc.level.getBlockState(feet))) return null;
+        for (BlockPos occupied : BlockPos.betweenClosed(feet, BlockPos.containing(floor.getX() + .5, height + mc.player.getBbHeight() - .01, floor.getZ() + .5))) {
+            BlockState occupiedState = mc.level.getBlockState(occupied);
+            if (hazard(occupiedState) || !occupiedState.getFluidState().isEmpty()) return null;
+        }
         return new Stand(floor.immutable(), height);
     }
     private Stand nearFoot(BlockPos cell, double desiredHeight) {
@@ -123,6 +127,9 @@ public final class ClientMotor {
     private double heuristic(Stand a, Stand b) {
         return Math.abs(a.floor.getX() - b.floor.getX()) + Math.abs(a.floor.getZ() - b.floor.getZ()) + Math.abs(a.height - b.height);
     }
+    private boolean stepAllowed(Stand current, Stand next) {
+        return next != null && next.height - current.height <= 1.01 && current.height - next.height <= 2.01;
+    }
     private List<Stand> plan(Stand start, Stand end) {
         PriorityQueue<Candidate> frontier = new PriorityQueue<>(Comparator.comparingDouble(Candidate::estimate));
         Map<BlockPos, Double> costs = new HashMap<>(); Map<BlockPos, Stand> parent = new HashMap<>();
@@ -141,7 +148,7 @@ public final class ClientMotor {
                     BlockPos nextFloor = current.floor.relative(direction).offset(0, dy, 0);
                     if (Math.abs(nextFloor.getX() - start.floor.getX()) > range || Math.abs(nextFloor.getZ() - start.floor.getZ()) > range) continue;
                     Stand next = stand(nextFloor);
-                    if (next == null || next.height - current.height > 1.01 || current.height - next.height > 2.01) continue;
+                    if (!stepAllowed(current, next)) continue;
                     double cost = candidate.cost + 1 + Math.max(0, next.height - current.height) * .8;
                     if (cost < costs.getOrDefault(next.floor, Double.MAX_VALUE)) {
                         costs.put(next.floor, cost); parent.put(next.floor, current);
@@ -256,11 +263,22 @@ public final class ClientMotor {
             if (hit == null) { result("FAILED: mining lost reach at " + digging); digging = null; mc.gameMode.stopDestroyBlock(); return; }
             look(hit.getLocation()); mc.gameMode.continueDestroyBlock(digging, hit.getDirection()); mc.player.swing(InteractionHand.MAIN_HAND); return;
         }
-        if (following != null && taskTicks++ % 20 == 0) {
+        // A route step resets taskTicks. Following needs its own clock or target refresh
+        // can starve while walking, and movement timeouts can be reset by replanning.
+        if (following != null && --followTicks <= 0) {
             String name = following;
             Entity target = mc.level.players().stream().filter(p -> p.getName().getString().equalsIgnoreCase(name)).findFirst().orElse(null);
-            if (target == null) { result("FAILED: followed player is not loaded"); following = null; }
-            else if (mc.player.distanceTo(target) > 3) { String outcome = moveTo(target.blockPosition()); following = name; if (outcome.startsWith("FAILED")) { result(outcome); following = null; } }
+            if (target == null) { stop(); result("FAILED: followed player is not loaded"); }
+            else if (mc.player.distanceTo(target) <= 3) {
+                route.clear(); destination = null; taskTicks = 0; stillTicks = 0; followTicks = 20;
+            } else {
+                if (route.isEmpty() || destination == null || destination.distanceTo(target.position()) > 1.5) {
+                    String outcome = moveTo(target.blockPosition());
+                    if (outcome.startsWith("FAILED")) { stop(); result(outcome); }
+                    else following = name;
+                }
+                followTicks = 20;
+            }
         }
         if (collecting != null && mc.level.entitiesForRendering() != null) {
             boolean exists = false; for (Entity entity : mc.level.entitiesForRendering()) if (entity.getUUID().equals(collecting)) { exists = true; break; }
@@ -287,6 +305,47 @@ public final class ClientMotor {
         if (Math.abs(net.minecraft.util.Mth.wrapDegrees(targetYaw - mc.player.getYRot())) < 50) mc.options.keyUp.setDown(true);
         if (next.height > mc.player.getY() + .2 || stillTicks > 12) mc.options.keyJump.setDown(true);
     }
+    /** At most eight nearby positions connected to the player by the same dry walking rules as moveTo. */
+    private JsonArray safeDestinations(int radius) {
+        JsonArray destinations = new JsonArray();
+        Stand start = nearFoot(mc.player.blockPosition(), mc.player.getY());
+        if (start == null) return destinations;
+        int scanRange = Math.min(radius, 6);
+        ArrayDeque<Stand> frontier = new ArrayDeque<>(); frontier.add(start);
+        Map<BlockPos, Integer> steps = new HashMap<>(); steps.put(start.floor, 0);
+        Map<BlockPos, Stand> cache = new HashMap<>(); cache.put(start.floor, start);
+        Stand[] choices = new Stand[8]; double[] scores = new double[8]; Arrays.fill(scores, Double.MAX_VALUE);
+        int expanded = 0;
+        while (!frontier.isEmpty() && expanded++ < 128) {
+            Stand current = frontier.removeFirst();
+            double dx = current.center().x - mc.player.getX(), dz = current.center().z - mc.player.getZ();
+            double distance = Math.sqrt(dx * dx + dz * dz);
+            if (distance >= 1.5 && distance <= scanRange) {
+                int direction = Math.floorMod((int) Math.round(Math.atan2(dz, dx) / (Math.PI / 4)), 8);
+                double score = Math.abs(distance - Math.min(scanRange, 4)) + steps.get(current.floor) * .02;
+                if (score < scores[direction]) { choices[direction] = current; scores[direction] = score; }
+            }
+            for (Direction direction : Direction.Plane.HORIZONTAL) for (int dy = -2; dy <= 1; dy++) {
+                BlockPos nextFloor = current.floor.relative(direction).offset(0, dy, 0);
+                if (Math.abs(nextFloor.getX() - start.floor.getX()) > scanRange
+                        || Math.abs(nextFloor.getZ() - start.floor.getZ()) > scanRange || steps.containsKey(nextFloor)) continue;
+                if (!cache.containsKey(nextFloor)) cache.put(nextFloor, stand(nextFloor));
+                Stand next = cache.get(nextFloor);
+                if (!stepAllowed(current, next)) continue;
+                steps.put(nextFloor, steps.get(current.floor) + 1); frontier.addLast(next);
+            }
+        }
+        String[] directions = {"east", "southeast", "south", "southwest", "west", "northwest", "north", "northeast"};
+        for (int direction = 0; direction < choices.length; direction++) {
+            Stand choice = choices[direction]; if (choice == null) continue;
+            JsonObject position = new JsonObject();
+            position.addProperty("x", choice.floor.getX()); position.addProperty("y", (int) Math.floor(choice.height)); position.addProperty("z", choice.floor.getZ());
+            position.addProperty("direction", directions[direction]);
+            position.addProperty("distance", Math.round(mc.player.position().distanceTo(choice.center()) * 10) / 10.0);
+            position.addProperty("pathSteps", steps.get(choice.floor)); destinations.add(position);
+        }
+        return destinations;
+    }
     public JsonObject snapshot(int radius) {
         JsonObject state = new JsonObject();
         if (mc.player == null || mc.level == null) return state;
@@ -294,6 +353,7 @@ public final class ClientMotor {
         state.addProperty("health", mc.player.getHealth()); state.addProperty("food", mc.player.getFoodData().getFoodLevel());
         state.addProperty("air", mc.player.getAirSupply()); state.addProperty("dimension", mc.level.dimension().identifier().toString());
         state.addProperty("task", status()); state.addProperty("hotbarSlot", mc.player.getInventory().getSelectedSlot());
+        state.add("safeDestinations", safeDestinations(radius));
         JsonArray blocks = new JsonArray(); BlockPos origin = mc.player.blockPosition();
         for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-radius, -3, -radius), origin.offset(radius, 5, radius))) {
             if (!mc.level.hasChunkAt(pos)) continue;

@@ -15,7 +15,7 @@ public final class PartnerConfig {
     public String apiKeyEnv = "";
     public int maxTokens = 1024;
     public int timeoutSeconds = 120;
-    public int decisionIntervalSeconds = 8;
+    public int decisionIntervalSeconds = 2;
     public int scanRadius = 8;
     public int navigationRange = 32;
     public String publicCommandPrefix = "!ai ";
