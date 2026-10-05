@@ -45,6 +45,7 @@ final class CombatReflexGameTest {
             partner.command("auto", "off"); // No LLM calls; self-defence remains available while takeover is enabled.
             mc.player.getInventory().setSelectedSlot(1);
             check(partner.motor().dig(log).startsWith("STARTED"), "combat fixture mining did not start");
+            mc.gui.setScreen(new net.minecraft.client.gui.screens.ChatScreen("KEEP_COMBAT_DRAFT", false));
         });
         server.runOnServer(mcServer -> {
             var player = connection.getServerPlayer();
@@ -61,6 +62,7 @@ final class CombatReflexGameTest {
         });
         context.waitTicks(35); connection.waitForServerboundPackets();
         server.runOnServer(mcServer -> check(target.get().getHealth() < 20, "server never received a real reflex attack"));
+        context.runOnClient(mc -> check(mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen, "combat closed the chat draft"));
         server.runOnServer(mcServer -> target.get().discard());
         connection.waitForClientboundPackets();
         context.waitFor(mc -> !PartnerClient.instance().motor().defending(), 50);
@@ -81,6 +83,7 @@ final class CombatReflexGameTest {
         server.runOnServer(mcServer -> check(creeper.get().getHealth() == 20, "creeper reflex attacked instead of retreating"));
         context.runOnClient(mc -> PartnerClient.instance().command("disable", ""));
         context.runOnClient(mc -> check(!PartnerClient.instance().motor().defending(), "pause did not stop self-defence"));
+        context.runOnClient(mc -> mc.gui.setScreen(null));
         server.runOnServer(mcServer -> { creeper.get().discard(); connection.getServerLevel().setBlockAndUpdate(log, Blocks.AIR.defaultBlockState()); });
         connection.waitForClientboundPackets();
     }

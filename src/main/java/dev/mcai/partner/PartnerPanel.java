@@ -22,7 +22,7 @@ public final class PartnerPanel extends Screen {
     private final PartnerClient partner;
     private boolean settings;
     private int left, top, panelWidth, panelHeight, innerWidth, bodyTop, footerTop;
-    private EditBox goal, endpoint, model, keyEnv;
+    private EditBox goal, endpoint, model, key;
     private Button enableButton, sendButton, stopButton, autoButton, releaseButton;
     private String goalDraft = "";
     private String endpointDraft, modelDraft, keyDraft;
@@ -36,7 +36,7 @@ public final class PartnerPanel extends Screen {
         this.partner = partner;
         endpointDraft = partner.config().baseUrl;
         modelDraft = partner.config().model;
-        keyDraft = partner.config().apiKeyEnv;
+        keyDraft = partner.config().apiKey;
         thinkingDraft = partner.config().enableThinking;
         protocolDraft = ReasoningProtocol.fromId(partner.config().reasoningProtocol);
     }
@@ -49,7 +49,7 @@ public final class PartnerPanel extends Screen {
         innerWidth = panelWidth - 28;
         bodyTop = top + 68;
         footerTop = top + panelHeight - 26;
-        goal = endpoint = model = keyEnv = null;
+        goal = endpoint = model = key = null;
         enableButton = sendButton = stopButton = autoButton = releaseButton = null;
 
         button("行动", left + 14, top + 43, 94, settings ? Tone.NORMAL : Tone.SELECTED,
@@ -67,11 +67,11 @@ public final class PartnerPanel extends Screen {
 
     private void initDashboard() {
         int sendWidth = 78;
-        goal = edit("本地任务", left + 14, bodyTop + 16, innerWidth - sendWidth - 8, 512, goalDraft);
-        goal.setHint(Component.literal("例如：收集附近的原木"));
+        goal = edit("本地对话", left + 14, bodyTop + 16, innerWidth - sendWidth - 8, 512, goalDraft);
+        goal.setHint(Component.literal("日常在服务器聊天 @它；这里是本地优先对话"));
         goal.setResponder(value -> goalDraft = value);
-        sendButton = button("下达任务", left + panelWidth - 14 - sendWidth, bodyTop + 16, sendWidth,
-                Tone.PRIMARY, "本地任务优先；输入后也可按 Enter", b -> submitGoal());
+        sendButton = button("发送", left + panelWidth - 14 - sendWidth, bodyTop + 16, sendWidth,
+                Tone.PRIMARY, "用自然语言交流；本地对话优先，也可按 Enter", b -> submitGoal());
 
         int gap = 6;
         int buttonWidth = (innerWidth - gap * 3) / 4;
@@ -98,9 +98,14 @@ public final class PartnerPanel extends Screen {
         endpoint.setResponder(value -> endpointDraft = value);
         model = edit("模型名称", left + 14, bodyTop + 42, innerWidth, 256, modelDraft);
         model.setResponder(value -> modelDraft = value);
-        keyEnv = edit("API key 环境变量名", left + 14, bodyTop + 72, innerWidth, 256, keyDraft);
-        keyEnv.setHint(Component.literal("本地模型留空；API 填环境变量名"));
-        keyEnv.setResponder(value -> keyDraft = value);
+        key = addRenderableWidget(new SecretEditBox(font, left + 14, bodyTop + 72, innerWidth, 20));
+        key.setMaxLength(4096);
+        key.setValue(keyDraft == null ? "" : keyDraft);
+        key.setTextColor(TEXT);
+        key.addFormatter((value, offset) -> net.minecraft.util.FormattedCharSequence.forward("*".repeat(value.length()), net.minecraft.network.chat.Style.EMPTY));
+        key.setHint(Component.literal("直接粘贴 API 密钥；本地模型留空"));
+        key.setTooltip(Tooltip.create(Component.literal("直接填写并保存在这个客户端的本地配置中，不发送到游戏服务器。保存空值会清除已存密钥。")));
+        key.setResponder(value -> keyDraft = value);
         int gap = 6;
         int w = (innerWidth - gap * 3) / 4;
         int row = bodyTop + 98;
@@ -109,11 +114,11 @@ public final class PartnerPanel extends Screen {
                     thinkingDraft = !thinkingDraft;
                     b.setMessage(Component.literal(thinkingDraft ? "推理：开" : "推理：关"));
                 });
-        button("协议：" + protocolDraft.label(), left + 14 + w + gap, row, w, Tone.NORMAL,
-                "点击切换：自动、llama.cpp、模板、通义、DeepSeek、无扩展。未知 API 请按服务文档选择", b -> {
+        button("兼容：" + protocolDraft.label(), left + 14 + w + gap, row, w, Tone.NORMAL,
+                "默认自动。只决定如何给不同服务发送推理开关，普通聊天接口相同；出现不支持的参数时切换。", b -> {
                     var protocols = ReasoningProtocol.values();
                     protocolDraft = protocols[(protocolDraft.ordinal() + 1) % protocols.length];
-                    b.setMessage(Component.literal("协议：" + protocolDraft.label()));
+                    b.setMessage(Component.literal("兼容：" + protocolDraft.label()));
                 });
         button("保存连接", left + 14 + (w + gap) * 2, row, w, Tone.PRIMARY,
                 "保存后请回行动页开始接管", b -> saveSettings());
@@ -122,7 +127,7 @@ public final class PartnerPanel extends Screen {
                     if (partner.command("reload", "") == 1) {
                         endpointDraft = partner.config().baseUrl;
                         modelDraft = partner.config().model;
-                        keyDraft = partner.config().apiKeyEnv;
+                        keyDraft = partner.config().apiKey;
                         thinkingDraft = partner.config().enableThinking;
                         protocolDraft = ReasoningProtocol.fromId(partner.config().reasoningProtocol);
                         settingsMessage = "配置已重载。";
@@ -159,22 +164,18 @@ public final class PartnerPanel extends Screen {
     private void saveSettings() {
         String address = endpoint.getValue().strip();
         String name = model.getValue().strip();
-        String environment = keyEnv.getValue().strip();
+        String apiKey = key.getValue().strip();
         try {
             URI uri = URI.create(address);
             if ((!"http".equalsIgnoreCase(uri.getScheme()) && !"https".equalsIgnoreCase(uri.getScheme())) || uri.getHost() == null)
                 throw new IllegalArgumentException("模型地址应为完整的 http:// 或 https:// 地址。");
             if (name.isBlank()) throw new IllegalArgumentException("请填写模型名称。");
-            if (!environment.isEmpty() && !environment.matches("[A-Za-z_][A-Za-z0-9_]*"))
-                throw new IllegalArgumentException("这里填写环境变量名，例如 MC_AI_API_KEY。");
-            if (partner.command("endpoint", address) != 1 || partner.command("model", name) != 1
-                    || partner.command("keyenv", environment) != 1
-                    || partner.command("thinking", thinkingDraft ? "on" : "off") != 1
-                    || partner.command("reasoningprotocol", protocolDraft.id()) != 1)
-                throw new IllegalStateException("连接保存失败，请查看行动页的最新反馈。");
+            if (uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null)
+                throw new IllegalArgumentException("模型地址不能包含账号、查询参数或片段；密钥请填在 API 密钥框。");
+            partner.saveConnection(address, name, apiKey, thinkingDraft, protocolDraft.id());
             settingsMessage = "已保存，开始接管后使用新连接。";
             if (protocolDraft.resolve(uri) == ReasoningProtocol.NONE)
-                settingsMessage = "已保存。当前协议不发送推理参数；请按后端文档选择协议。";
+                settingsMessage = "已保存。此服务按自身默认推理设置运行；需要开关时可调整兼容选项。";
             settingsError = false;
         } catch (Exception error) {
             settingsMessage = error.getMessage() == null ? "连接设置无效。" : error.getMessage();
@@ -225,7 +226,7 @@ public final class PartnerPanel extends Screen {
     }
 
     private void renderDashboard(GuiGraphicsExtractor graphics) {
-        graphics.text(font, "下一步做什么", left + 14, bodyTop + 2, TEXT, false);
+        graphics.text(font, "本地对话（可选）", left + 14, bodyTop + 2, TEXT, false);
         int cardTop = bodyTop + 76;
         int cardBottom = footerTop - 10;
         graphics.fill(left + 14, cardTop, left + panelWidth - 14, cardBottom, 0xFF101C26);
@@ -247,10 +248,10 @@ public final class PartnerPanel extends Screen {
     private void renderSettings(GuiGraphicsExtractor graphics) {
         graphics.text(font, "模型地址", left + 14, bodyTop + 1, TEXT, false);
         graphics.text(font, "模型名称", left + 14, bodyTop + 31, TEXT, false);
-        graphics.text(font, "API key 环境变量名（本地模型可留空）", left + 14, bodyTop + 61, MUTED, false);
+        graphics.text(font, "API 密钥（直接粘贴，本地模型可留空）", left + 14, bodyTop + 61, MUTED, false);
         int messageY = bodyTop + 126;
         if (footerTop - messageY > 12) {
-            String message = settingsMessage.isBlank() ? "地址支持本地服务和兼容 API。API 密钥保存在环境变量中。" : settingsMessage;
+            String message = settingsMessage.isBlank() ? "密钥只保存于本地客户端。推理兼容选项默认用自动。" : settingsMessage;
             wrapped(graphics, message, left + 14, messageY, innerWidth, Math.max(1, (footerTop - messageY - 6) / 11), settingsError ? ERROR : MUTED);
         }
     }
@@ -270,6 +271,15 @@ public final class PartnerPanel extends Screen {
     @Override public boolean isPauseScreen() { return false; }
 
     private enum Tone { NORMAL, PRIMARY, DANGER, SELECTED }
+
+    private static final class SecretEditBox extends EditBox {
+        private SecretEditBox(net.minecraft.client.gui.Font font, int x, int y, int width, int height) {
+            super(font, x, y, width, height, Component.literal("API 密钥"));
+        }
+        @Override protected net.minecraft.network.chat.MutableComponent createNarrationMessage() {
+            return Component.literal(getValue().isBlank() ? "API 密钥，未填写" : "API 密钥，已填写");
+        }
+    }
 
     /** Native button behavior and narration, with a calm, readable panel palette. */
     private static final class PanelButton extends Button {

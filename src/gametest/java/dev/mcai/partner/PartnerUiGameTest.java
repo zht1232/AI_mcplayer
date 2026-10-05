@@ -168,6 +168,7 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                 mc.gui.setScreen(null);
             });
             CombatReflexGameTest.run(context, server, connection);
+            SurvivalGameTest.run(context, server, connection);
             context.runOnClient(mc -> {
                 PartnerClient partner = PartnerClient.instance();
                 partner.command("disable", "");
@@ -179,18 +180,33 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
             context.takeScreenshot("mc-ai-partner-panel");
             context.clickScreenButton("连接");
             context.clickScreenButton("推理：关");
-            context.clickScreenButton("协议：自动");
+            context.clickScreenButton("兼容：自动");
+            context.runOnClient(mc -> {
+                var field = mc.gui.screen().children().stream()
+                        .filter(widget -> widget instanceof net.minecraft.client.gui.components.EditBox box && box.getMessage().getString().equals("API 密钥"))
+                        .map(widget -> (net.minecraft.client.gui.components.EditBox)widget).findFirst().orElseThrow();
+                field.setValue("sk-ui-test-secret");
+                check(!PartnerClient.instance().uiBridge().snapshot().toString().contains("sk-ui-test-secret"), "local secret entered an exported UI observation");
+            });
             context.clickScreenButton("保存连接");
             context.runOnClient(mc -> {
                 try {
                     var saved = PartnerConfig.load();
                     check(saved.enableThinking && saved.reasoningProtocol.equals("llama"), "panel did not persist thinking/protocol settings");
+                    check(saved.apiKey.equals("sk-ui-test-secret") && saved.apiKeyEnv.isEmpty(), "panel did not persist direct API key");
                 } catch (java.io.IOException error) { throw new RuntimeException(error); }
             });
             context.clickScreenButton("推理：开");
+            context.runOnClient(mc -> mc.gui.screen().children().stream()
+                    .filter(widget -> widget instanceof net.minecraft.client.gui.components.EditBox box && box.getMessage().getString().equals("API 密钥"))
+                    .map(widget -> (net.minecraft.client.gui.components.EditBox)widget).findFirst().orElseThrow().setValue(""));
             context.clickScreenButton("保存连接");
             context.runOnClient(mc -> {
-                try { check(!PartnerConfig.load().enableThinking, "panel did not persist disabled thinking"); }
+                try {
+                    var saved = PartnerConfig.load();
+                    check(!saved.enableThinking, "panel did not persist disabled thinking");
+                    check(saved.apiKey.isEmpty() && saved.apiKeyEnv.isEmpty(), "clearing the input did not clear the stored credential");
+                }
                 catch (java.io.IOException error) { throw new RuntimeException(error); }
             });
             context.takeScreenshot("mc-ai-partner-model-settings");

@@ -67,16 +67,25 @@ public final class ModelObservation {
         int author = content.indexOf("对你说：");
         if (author >= 0) content = content.substring(author + 4).split("\\n", 2)[0];
         boolean menuOpen = rawUi.has("dialog") || (rawUi.has("container") && rawUi.getAsJsonObject("container").get("open").getAsBoolean());
-        if (rawUi.has("screen") && rawUi.get("screen").getAsString().equals("PauseScreen")) {
+        if (rawUi.has("screen") && Set.of("PauseScreen", "ChatScreen").contains(rawUi.get("screen").getAsString())) {
             ui.remove("widgets"); ui.remove("title");
             ui.addProperty("screen", "world");
-            ui.addProperty("localOverlay", "Esc menu is open; multiplayer world controls remain available.");
+            ui.addProperty("localOverlay", "A local overlay is open; multiplayer world controls remain available. Do not close or change local typing.");
         }
-        boolean working = content.matches("(?is).*(自主|采|挖|走|移动|跟|过来|收集|种|建|造|放置|战斗|攻击|整理|存|取|拿|给|吃|交易|买|卖|传送|tp|钓|合成|熔|返回|打开|关闭|周围|环境|看见).*");
+        boolean working = isWorkGoal(content);
         boolean inventory = menuOpen || working || content.matches("(?is).*(背包|物品|装备|食物|材料|木头|资源).*") || requested.contains("inventory") || requested.contains("menu");
         boolean world = !menuOpen && (working || requested.contains("world"));
         boolean hud = requested.contains("hud") || content.matches("(?is).*(状态|进度|效果|天气|时间|血量|提示|tpa|tpaccept|金币|余额).*");
         if (source.has("notes")) result.add("notes", source.get("notes").deepCopy());
+        if (source.has("playerName") && ui.has("chat")) {
+            String own = source.get("playerName").getAsString(); JsonArray external = new JsonArray();
+            var ownAuthor = java.util.regex.Pattern.compile("(?i)(?<![A-Za-z0-9_@])" + java.util.regex.Pattern.quote(own) + "\\s*[>»›:：]");
+            for (JsonElement message : ui.getAsJsonArray("chat")) {
+                String text = message.getAsJsonObject().get("text").getAsString();
+                if (!ownAuthor.matcher(text).find()) external.add(message);
+            }
+            ui.add("chat", external);
+        }
         if (!world && result.has("selfAndWorld")) {
             JsonObject surroundings = result.getAsJsonObject("selfAndWorld");
             surroundings.remove("visibleBlocks"); surroundings.remove("safeDestinations");
@@ -106,6 +115,12 @@ public final class ModelObservation {
         return result;
     }
 
+    public static boolean isWorkGoal(String value) {
+        String text = value == null ? "" : value;
+        int addressed = text.indexOf("对你说：");
+        if (addressed >= 0) text = text.substring(addressed + 4).split("\n", 2)[0];
+        return text.matches("(?is).*(自主|采|挖|走|移动|跟|过来|收集|收割|砍|种|建|造|放置|战斗|攻击|整理|存|取|拿|给|吃|回血|治疗|脱困|突围|借|交易|买|卖|传送|tp|钓|合成|熔|返回|打开|关闭|周围|环境|看见).*");
+    }
     private static JsonElement readable(JsonElement value) {
         if (value == null || value.isJsonNull()) return JsonNull.INSTANCE;
         if (value.isJsonPrimitive()) {

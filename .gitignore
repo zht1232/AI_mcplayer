@@ -14,3 +14,5 @@ scripts/baseline_test.py
 scripts/启动LLM服务.bat
 replay_pid*
 hs_err_pid*
+**/mc-ai-partner.json
+**/mc-ai-partner.json.*

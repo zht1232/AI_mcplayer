@@ -23,11 +23,15 @@ public final class ChatAddressing {
         // TrChat and other chat plugins frequently send ordinary system packets with a decorated author.
         // Locate an online player followed by a chat separator, so the bot's own name in the header
         // never looks like an incoming mention. Long names first avoid matching a shorter prefix.
-        for (String player : players.stream().sorted(Comparator.comparingInt(String::length).reversed()).toList()) {
-            Matcher author = Pattern.compile("(?i)(?<!" + EDGE + ")" + Pattern.quote(player)
-                    + "(?!" + EDGE + ")\\s*(?:[>»›:：]|\\]\\s*[>»›:：]?)\\s*").matcher(clean);
-            if (author.find()) return signed(clean.substring(author.end()), player, ownName, prefix);
+        java.util.Set<String> authors = new java.util.HashSet<>(players);
+        if (ownName != null && !ownName.isBlank()) authors.add(ownName);
+        String foundAuthor = null, body = null; int first = Integer.MAX_VALUE;
+        for (String player : authors.stream().sorted(Comparator.comparingInt(String::length).reversed()).toList()) {
+            Matcher author = Pattern.compile("(?i)(?<![A-Za-z0-9_@])" + Pattern.quote(player)
+                    + "(?!" + EDGE + ")\\s*(?:[>»›:：]|\\]\\s*[>»›:：])\\s*").matcher(clean);
+            if (author.find() && author.start() < first) { first = author.start(); foundAuthor = player; body = clean.substring(author.end()); }
         }
+        if (foundAuthor != null) return signed(body, foundAuthor, ownName, prefix);
         // Unformatted system prompts may contain the player's name (for example TPA).
         // Keep those as observations; only an explicit @ or command prefix addresses us.
         if (ownName == null || ownName.isBlank() || prefix == null || prefix.isBlank()) return Optional.empty();

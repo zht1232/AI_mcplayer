@@ -282,6 +282,34 @@ class AiBrainTest {
         }
     }
 
+    @Test void directApiKeyTakesPriorityAndOnlyTravelsInAuthorizationHeader() throws Exception {
+        String secret = "sk-test-direct-entry-8519";
+        AiBrain.Options options = new AiBrain.Options(root, "test-model", "MCAI_TEST_NONEXISTENT_KEY_C6829A30",
+                512, 5, false, "auto", secret);
+        assertFalse(options.toString().contains(secret));
+        try (AiBrain brain = new AiBrain(options, List.of(toolSchema()))) {
+            brain.request(new JsonObject(), "问候", List.of()).get(5, TimeUnit.SECONDS);
+            assertEquals("Bearer " + secret, authorization);
+            assertFalse(request.toString().contains(secret));
+        }
+    }
+
+    @Test void directApiKeyIsRedactedFromHttpErrorAndRejectsHeaderInjection() {
+        String secret = "sk-test-direct-redaction-1042";
+        status = 401;
+        JsonObject detail = new JsonObject(); detail.addProperty("message", "Rejected key " + secret);
+        JsonObject error = new JsonObject(); error.add("error", detail); response = error.toString();
+        try (AiBrain brain = new AiBrain(new AiBrain.Options(root, "test-model", "", 512, 5,
+                false, "auto", secret), List.of(toolSchema()))) {
+            CompletionException failure = assertThrows(CompletionException.class,
+                    () -> brain.request(new JsonObject(), "", List.of()).join());
+            assertTrue(failure.getCause().getMessage().contains("[redacted]"));
+            assertFalse(failure.getCause().getMessage().contains(secret));
+        }
+        assertThrows(IllegalArgumentException.class, () -> new AiBrain.Options(root, "test-model", "", 512, 5,
+                false, "auto", "secret\nInjected: header"));
+    }
+
     @Test void preventsOverlappingRequestsAndCancelsOnClose() throws Exception {
         responseGate = new CountDownLatch(1);
         AiBrain brain = brain(root, "");

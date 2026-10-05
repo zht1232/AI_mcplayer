@@ -146,7 +146,8 @@ public final class UiBridge {
             container.add("cursor", item(menu.getCarried()));
             result.add("container", container);
         }
-        observedWidgets = collectWidgets(screen);
+        observedWidgets = screen instanceof dev.mcai.partner.PartnerPanel || screen instanceof ChatScreen
+                || screen instanceof net.minecraft.client.gui.screens.PauseScreen ? List.of() : collectWidgets(screen);
         widgetScreen = screen;
         JsonArray widgets = new JsonArray();
         for (int i = 0; i < observedWidgets.size(); i++) {
@@ -292,10 +293,9 @@ public final class UiBridge {
         if (client.player == null) return "失败：未进入世界";
         if (text == null || text.isBlank() || text.length() > 256 || text.contains("\n") || text.contains("\r")) return "失败：聊天输入须为 1–256 字符的单行文本";
         if (localCommand(text)) return "失败：AI 聊天工具不能调用 /aip 本地控制命令";
-        ChatScreen screen = client.gui.screen() instanceof ChatScreen current ? current : new ChatScreen("", false);
+        ChatScreen screen = new ChatScreen("", false); // Detached sender never owns or closes the user's draft.
         // Uses vanilla normalization, history and signed command/chat sending.
         screen.handleChatInput(text, true);
-        if (client.gui.screen() == screen) screen.onClose();
         refreshRevision();
         return "已发送聊天输入；等待服务器反馈";
     }
@@ -346,7 +346,8 @@ public final class UiBridge {
     }
 
     private List<AbstractWidget> collectWidgets(Screen screen) {
-        if (screen == null) return List.of();
+        // Local owner settings can contain credentials and are never server UI/model input.
+        if (screen == null || screen instanceof dev.mcai.partner.PartnerPanel) return List.of();
         List<AbstractWidget> widgets = new ArrayList<>();
         Set<GuiEventListener> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         for (GuiEventListener child : screen.children()) collect(child, widgets, seen);

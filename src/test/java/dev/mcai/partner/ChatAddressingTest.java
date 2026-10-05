@@ -35,4 +35,10 @@ class ChatAddressingTest {
         assertTrue(ChatAddressing.decorated("Steve 请求传送到 AI_Partner，请输入 /tpaccept", "AI_Partner", "!ai ", players).isEmpty());
         assertEquals("你好", ChatAddressing.decorated("@AI_Partner 你好", "AI_Partner", "!ai ", players).orElseThrow().text());
     }
+    @Test void missingOwnTabEntryAndMentionColonDoNotCreateSelfConversations() {
+        assertTrue(ChatAddressing.decorated("[world] [旅行者] cbjttt: @cbjttt 小麦到了", "cbjttt", "!ai ", List.of("Steve")).isEmpty());
+        var request = ChatAddressing.decorated("Steve: @AI_Partner: 收小麦", "AI_Partner", "!ai ", List.of("Steve", "AI_Partner")).orElseThrow();
+        assertEquals("Steve", request.speaker());
+        assertEquals("收小麦", request.text());
+    }
 }

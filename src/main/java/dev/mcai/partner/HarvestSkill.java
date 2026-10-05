@@ -17,10 +17,12 @@ public final class HarvestSkill {
     private boolean mined;
     private int age;
     private String outcome;
+    private final java.util.Map<BlockPos, Long> retryAfter = new java.util.HashMap<>();
     public HarvestSkill(Minecraft mc, ClientMotor motor) { this.mc = mc; this.motor = motor; }
     public boolean busy() { return target != null; }
     public void stop() { target = null; phase = null; mined = false; age = 0; }
     public String start(BlockPos block) {
+        if (retryAfter.getOrDefault(block, 0L) > System.currentTimeMillis()) return "FAILED: this target recently failed; choose another or check the server interaction rule";
         if (busy() || motor.busy()) return "FAILED: another physical skill is running";
         if (mc.player == null || mc.level == null || ScreenPolicy.blocksWorld(mc.gui.screen())) return "FAILED: world controls are unavailable";
         if (!mc.level.hasChunkAt(block) || mc.level.getBlockState(block).isAir()
@@ -66,11 +68,17 @@ public final class HarvestSkill {
                 if (!mined) { finish("FAILED: mining ended without authoritative server confirmation"); return; }
                 String pickup = motor.collect();
                 if (pickup.startsWith("STARTED")) phase = Phase.PICKUP;
-                else finish("OK: block mined; no visible dropped item remained, inspect inventory");
+                else finish("MINED: server confirmed the block change; read passive inventory counts, no screen opening is needed");
             }
-            case PICKUP -> finish("OK: harvest sequence ended; inspect actual inventory count");
+            case PICKUP -> finish("OK: harvest sequence ended; read passive inventory counts, no screen opening is needed");
         }
     }
-    private void finish(String result) { outcome = result; stop(); }
+    private void finish(String result) {
+        if (result.startsWith("FAILED") && target != null) {
+            retryAfter.put(target, System.currentTimeMillis() + 60_000);
+            if (retryAfter.size() > 64) retryAfter.remove(retryAfter.keySet().iterator().next());
+        }
+        outcome = result; stop();
+    }
     public String drainOutcome() { String value = outcome; outcome = null; return value; }
 }

@@ -13,6 +13,8 @@ public final class PartnerConfig {
     private static final Gson JSON = new GsonBuilder().setPrettyPrinting().create();
     public String baseUrl = "http://127.0.0.1:8080/v1";
     public String model = "Qwen3.5-4B";
+    /** Direct entry stays on this client; it is never included in game observations. */
+    public String apiKey = "";
     public String apiKeyEnv = "";
     public boolean enableThinking = false;
     public String reasoningProtocol = "auto";
@@ -40,6 +42,10 @@ public final class PartnerConfig {
     }
     public void validate() {
         if (baseUrl == null || model == null || model.isBlank()) throw new IllegalArgumentException("模型地址和名称不能为空");
+        apiKey = apiKey == null ? "" : apiKey.strip();
+        apiKeyEnv = apiKeyEnv == null ? "" : apiKeyEnv.strip();
+        if (apiKey.length() > 4096 || apiKey.chars().anyMatch(c -> c < 32 || c > 126))
+            throw new IllegalArgumentException("API 密钥包含无效字符或过长");
         reasoningProtocol = ReasoningProtocol.fromId(reasoningProtocol).id();
         if (decisionIntervalSeconds < 2 || decisionIntervalSeconds > 120) throw new IllegalArgumentException("规划间隔应为 2–120 秒");
         if (scanRadius < 2 || scanRadius > 12 || navigationRange < 4 || navigationRange > 64) throw new IllegalArgumentException("扫描/导航范围超出限制");
@@ -51,4 +57,5 @@ public final class PartnerConfig {
         Files.createDirectories(path().getParent());
         Files.writeString(path(), JSON.toJson(this), StandardCharsets.UTF_8);
     }
+    public PartnerConfig copy() { return JSON.fromJson(JSON.toJson(this), PartnerConfig.class); }
 }

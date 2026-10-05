@@ -58,12 +58,23 @@ public final class AiBrain implements AutoCloseable {
             use harvest_block to approach/mine/pick up instead of repeatedly describing it.
             collect_nearby only collects an ItemEntity already on the ground; it never mines.
             If a world action fails, do not repeat the same attempt unchanged.
+            ItemDisplay/BlockDisplay entities can be REAL plugin crops. Read displayed item
+            and backing blocks. Never infer "fake wheat" from an entity type or earlier chat.
+            Inventory counts are already in the observation: do not open inventory to check
+            them. Continuous quantity collection is handled by a deterministic skill.
+            Retrieved skills/notes are fallible. Correct bad memories against actual server
+            block changes, inventory deltas and the owner's explicit corrections.
             """;
 
     public record Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds,
-                          boolean enableThinking, String reasoningProtocol) {
+                          boolean enableThinking, String reasoningProtocol, String apiKey) {
         public Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds) {
-            this(baseUrl, model, apiKeyEnv, maxTokens, timeoutSeconds, false, "auto");
+            this(baseUrl, model, apiKeyEnv, maxTokens, timeoutSeconds, false, "auto", "");
+        }
+
+        public Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds,
+                       boolean enableThinking, String reasoningProtocol) {
+            this(baseUrl, model, apiKeyEnv, maxTokens, timeoutSeconds, enableThinking, reasoningProtocol, "");
         }
 
         public Options {
@@ -79,10 +90,21 @@ public final class AiBrain implements AutoCloseable {
             baseUrl = baseUrl.trim();
             model = model.trim();
             apiKeyEnv = apiKeyEnv == null ? "" : apiKeyEnv.trim();
+            apiKey = apiKey == null ? "" : apiKey.trim();
+            if (apiKey.length() > 4096 || apiKey.chars().anyMatch(c -> c < 32 || c > 126)) {
+                throw new IllegalArgumentException("API key contains invalid HTTP header characters or is too long");
+            }
             if (!apiKeyEnv.isEmpty() && !apiKeyEnv.matches("[A-Za-z_][A-Za-z0-9_]*")) {
                 throw new IllegalArgumentException("apiKeyEnv must be an environment variable name");
             }
             reasoningProtocol = ReasoningProtocol.fromId(reasoningProtocol).id();
+        }
+
+        @Override public String toString() {
+            return "Options[baseUrl=" + baseUrl + ", model=" + model + ", apiKeyEnv=" + apiKeyEnv
+                    + ", maxTokens=" + maxTokens + ", timeoutSeconds=" + timeoutSeconds
+                    + ", enableThinking=" + enableThinking + ", reasoningProtocol=" + reasoningProtocol
+                    + ", apiKey=" + (apiKey.isEmpty() ? "<empty>" : "<redacted>") + "]";
         }
     }
 
@@ -152,8 +174,8 @@ public final class AiBrain implements AutoCloseable {
         if (closed) return CompletableFuture.failedFuture(new BrainException("AI brain is closed"));
         if (active != null) return CompletableFuture.failedFuture(new BrainException("An AI request is already running"));
         try {
-            String apiKey = "";
-            if (!options.apiKeyEnv().isEmpty()) {
+            String apiKey = options.apiKey();
+            if (apiKey.isEmpty() && !options.apiKeyEnv().isEmpty()) {
                 apiKey = System.getenv(options.apiKeyEnv());
                 if (apiKey == null || apiKey.isBlank()) {
                     throw new BrainException("API key environment variable is not set: " + options.apiKeyEnv());
@@ -216,7 +238,9 @@ public final class AiBrain implements AutoCloseable {
         Objects.requireNonNull(recentResults, "recentResults");
         JsonObject context = new JsonObject();
         context.addProperty("goal", goal == null ? "" : goal);
-        context.add("observation", observation.deepCopy());
+        JsonObject current = observation.deepCopy();
+        if (current.has("skillKnowledge")) context.add("skillKnowledge", current.remove("skillKnowledge"));
+        context.add("observation", current);
         JsonArray results = new JsonArray();
         for (int i = Math.max(0, recentResults.size() - 6); i < recentResults.size(); i++) {
             String value = Objects.toString(recentResults.get(i), "");

@@ -12,6 +12,7 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.KeyMapping;
@@ -44,11 +45,18 @@ public final class PartnerClient implements ClientModInitializer {
     private record Speech(String text, long tick) {}
     private final ArrayDeque<Speech> recentSpeech = new ArrayDeque<>();
     private final SpeechPolicy speechPolicy = new SpeechPolicy();
+    private final InventoryOpenPolicy inventoryPolicy = new InventoryOpenPolicy();
     private HarvestSkill harvest;
     private long workProgress;
     private int narrationOnlyDecisions;
     private long lastDecisionProgress = -1;
     private long nextFallback;
+    private RuntimeSkillBook skillBook;
+    private long collectionGeneration = -1;
+    private long nextHelpRequest;
+    private int helpUrgency;
+    private boolean emittingSpeech;
+    private final ArrayDeque<JsonObject> dialogue = new ArrayDeque<>();
     private PartnerConfig config;
     private UiBridge ui;
     private ClientMotor motor;
@@ -64,6 +72,7 @@ public final class PartnerClient implements ClientModInitializer {
     private String lastError = "";
     private String targetItem;
     private int targetCount;
+    private int targetStartCount;
     private int targetStableTicks;
     private net.minecraft.world.phys.Vec3 manualMoveTarget;
     private int movementStableTicks;
@@ -81,13 +90,22 @@ public final class PartnerClient implements ClientModInitializer {
         instance = this;
         try { config = PartnerConfig.load(); } catch (Exception e) { LOG.error("Invalid config; AI will require correction", e); configurationReady = false; config = new PartnerConfig(); lastError = "配置读取失败：" + e.getMessage(); }
         ui = new UiBridge(mc); motor = new ClientMotor(mc, config.navigationRange); harvest = new HarvestSkill(mc, motor);
+        try { skillBook = new RuntimeSkillBook(FabricLoader.getInstance().getConfigDir().resolve("wildling/skills")); }
+        catch (java.io.IOException e) { LOG.warn("Could not initialize skill knowledge: {}", e.getClass().getSimpleName()); }
         KeyMapping.Category category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath("mc_ai_partner", "controls"));
         panelKey = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.mc_ai_partner.panel", GLFW.GLFW_KEY_F8, category));
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
-            control.connect(); ui.clear(); feedback.clear(); actions.clear(); recentSpeech.clear(); speechPolicy.clear(); workProgress = 0;
+            control.connect(); ui.clear(); feedback.clear(); actions.clear(); recentSpeech.clear(); dialogue.clear(); speechPolicy.clear(); workProgress = 0;
             notice("已连接。F8 打开面板；/aip enable 开启当前账号的 AI。");
         });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> { control.disconnect(); invalidate(); motor.active(false); ui.clear(); });
+        ClientSendMessageEvents.ALLOW_CHAT.register(text -> {
+            if (!control.enabled() || emittingSpeech || modelActionActive || mc.player == null) return true;
+            ChatAddressing.signed(text, "本地用户", mc.player.getGameProfile().name(), config.publicCommandPrefix).ifPresent(request -> {
+                if (request.stop()) stop(); else takeLocalControl(request.text());
+            });
+            return true;
+        });
         ClientReceiveMessageEvents.CHAT.register((message, signed, sender, params, received) -> {
             ui.onMessage(message, false);
             if (mc.player == null) return;
@@ -100,8 +118,9 @@ public final class PartnerClient implements ClientModInitializer {
             ui.onMessage(message, overlay);
             if (!overlay && mc.player != null && mc.getConnection() != null) {
                 String line = message.getString();
-                if (recentSpeech.stream().anyMatch(spoken -> ticks - spoken.tick() <= 100
-                        && (line.equals(spoken.text()) || line.endsWith(spoken.text())))) return;
+                String normalized = line.replaceAll("[\\p{Z}\\s§]", "");
+                if (recentSpeech.stream().anyMatch(spoken -> ticks - spoken.tick() <= 1200
+                        && normalized.endsWith(spoken.text().replaceAll("[\\p{Z}\\s§]", "")))) return;
                 ChatAddressing.decorated(line, mc.player.getGameProfile().name(), config.publicCommandPrefix,
                         mc.getConnection().getOnlinePlayers().stream().map(player -> player.getProfile().name()).toList())
                         .ifPresent(this::publicInstruction);
@@ -125,7 +144,7 @@ public final class PartnerClient implements ClientModInitializer {
                     if (!net.minecraft.core.registries.BuiltInRegistries.ITEM.containsKey(Identifier.parse(item))) { notice("未知原版物品 ID"); return 0; }
                     int count = IntegerArgumentType.getInteger(ctx, "count");
                     takeLocalControl("采集新增 " + count + " 个 " + item + "；不足工具时先获得必要工具，拾取后检查背包。");
-                    targetItem = item; targetCount = motor.inventoryCount(item) + count; targetStableTicks = 0;
+                    targetItem = item; targetStartCount = motor.inventoryCount(item); targetCount = targetStartCount + count; targetStableTicks = 0;
                     return 1;
                 }))))
                 .then(literal("status").executes(ctx -> command("status", "")))
@@ -157,6 +176,7 @@ public final class PartnerClient implements ClientModInitializer {
     public ClientMotor motor() { return motor; }
     public boolean enabled() { return control.enabled(); }
     public boolean publicTaskActive() { return control.publicGoal(); }
+    public boolean collectionActive() { return targetItem != null; }
     public String status() {
         String activity = pending == null ? motor.status() : "等待模型 " + (System.nanoTime() - requestStartedNanos) / 1_000_000_000L + " 秒";
         activity = activity.replace("idle", "待命").replace("walking", "行走").replace("digging", "采掘").replace("eating", "进食").replace("following", "跟随");
@@ -175,15 +195,29 @@ public final class PartnerClient implements ClientModInitializer {
         if (!configurationReady) throw new IllegalStateException("先修复 " + PartnerConfig.path() + " 并用 /aip reload 重载");
         invalidate(); config.validate();
         brain = new AiBrain(new AiBrain.Options(config.baseUrl, config.model, config.apiKeyEnv, config.maxTokens, config.timeoutSeconds,
-                config.enableThinking, config.reasoningProtocol), ToolCatalog.schemas());
+                config.enableThinking, config.reasoningProtocol, config.apiKey), ToolCatalog.schemas());
         control.enable(); control.autonomous(true); motor.active(true); nextDecision = ticks; lastError = "";
         notice("拾野开始接管。提到或 @" + mc.player.getGameProfile().name() + " 可交流；本地控制优先。");
     }
     public void disable() { control.disable(); targetItem = null; manualMoveTarget = null; invalidate(); motor.active(false); notice("拾野已暂停。"); }
+    /** The local panel saves its whole connection at once; secrets never travel through chat commands. */
+    public void saveConnection(String address, String model, String apiKey, boolean thinking, String protocol) throws java.io.IOException {
+        PartnerConfig updated = config.copy();
+        updated.baseUrl = address; updated.model = model; updated.apiKey = apiKey;
+        // Direct entry replaces the legacy environment-variable source, including when cleared.
+        updated.apiKeyEnv = "";
+        updated.enableThinking = thinking; updated.reasoningProtocol = protocol;
+        updated.validate();
+        new AiBrain.Options(updated.baseUrl, updated.model, updated.apiKeyEnv, updated.maxTokens,
+                updated.timeoutSeconds, updated.enableThinking, updated.reasoningProtocol, updated.apiKey);
+        disable(); updated.save(); config = updated; configurationReady = true;
+        notice("连接设置已保存，开始接管后生效。");
+    }
     public void stop() { control.stop(); targetItem = null; manualMoveTarget = null; invalidateRequest(); motor.stop(); notice("已停止任务和自主规划。/aip auto on 恢复自主。"); }
     public void takeLocalControl(String goal) {
         requireEnabled(); targetItem = null; manualMoveTarget = null; control.submit(goal, ControlState.Priority.LOCAL); invalidateRequest(); motor.stop(); nextDecision = ticks;
         rememberResult("New local instruction: " + goal);
+        dialogue("user", "本地用户", goal);
     }
     public String moveManually(BlockPos position) {
         takeLocalControl("移动到 " + position);
@@ -202,6 +236,7 @@ public final class PartnerClient implements ClientModInitializer {
                 + "\n请像正常玩家一样用简短自然中文回复。若只是聊天，回复后调用 complete_goal 结束；若要求干活，回应后执行并核对结果。";
         long old = control.generation();
         if (control.submit(request, ControlState.Priority.PUBLIC)) {
+            dialogue("user", message.speaker(), message.text());
             if (old != control.generation()) { invalidateRequest(); motor.stop(); nextDecision = ticks; }
             else if (control.localControl()) say("收到，我先完成当前的本地安排，再处理你的消息。");
             rememberResult("Public player instruction accepted from " + message.speaker() + ": " + message.text());
@@ -223,7 +258,16 @@ public final class PartnerClient implements ClientModInitializer {
         if (obsolete != null) obsolete.cancel(true);
     }
     private void invalidate() { invalidateRequest(); if (brain != null) brain.close(); brain = null; }
-    private void rememberResult(String result) { feedback.addLast(result); while (feedback.size() > 12) feedback.removeFirst(); LOG.info("Action feedback: {}", result); }
+    private String serverKey() { return mc.getCurrentServer() == null ? "" : mc.getCurrentServer().ip; }
+    private void dialogue(String role, String speaker, String text) {
+        JsonObject turn = new JsonObject(); turn.addProperty("role", role); turn.addProperty("speaker", speaker); turn.addProperty("text", text.substring(0, Math.min(240, text.length())));
+        dialogue.addLast(turn); while (dialogue.size() > 6) dialogue.removeFirst();
+    }
+    private void rememberResult(String result) {
+        feedback.addLast(result); while (feedback.size() > 12) feedback.removeFirst(); LOG.info("Action feedback: {}", result);
+        if (skillBook != null) try { skillBook.feedback(serverKey(), result); }
+        catch (java.io.IOException e) { LOG.warn("Could not save bounded experience: {}", e.getClass().getSimpleName()); }
+    }
     public void notice(String text) { lastSpeech = text; LOG.info("{}", text); }
     /** Natural speech uses normal signed player chat; local status and errors stay in notice(). */
     private String say(String value) { return say(value, false); }
@@ -232,14 +276,18 @@ public final class PartnerClient implements ClientModInitializer {
         String text = value.replaceAll("[\\r\\n\\t]+", " ").strip();
         if (text.startsWith("/") || text.startsWith(config.publicCommandPrefix.strip())) return "FAILED: speech must not be a command";
         if (text.length() > 256) text = text.substring(0, 256);
+        if (targetItem != null && motor.inventoryCount(targetItem) < targetCount && text.matches("(?is).*(已经.*完成|收割完成|收割完了|收集完成|已完成).*"))
+            return "SKIPPED: completion claim does not match the verified inventory quota";
         if (!speechPolicy.allows(text, ticks, work, control.generation(), workProgress))
             return "SKIPPED: public update needs new progress or is too similar/recent";
-        String result = ui.inputChat(text);
+        String result; emittingSpeech = true;
+        try { result = ui.inputChat(text); } finally { emittingSpeech = false; }
         if (result.startsWith("已发送")) {
             recentSpeech.addLast(new Speech(text, ticks));
             speechPolicy.sent(text, ticks, work, control.generation(), workProgress);
             while (recentSpeech.size() > 8) recentSpeech.removeFirst();
             lastSpeech = text;
+            dialogue("assistant", mc.player.getGameProfile().name(), text);
             LOG.info("Player speech: {}", text);
         }
         return result;
@@ -254,6 +302,9 @@ public final class PartnerClient implements ClientModInitializer {
     }
     private JsonObject modelObservation(String goal) {
         JsonObject view = ModelObservation.select(observation(), goal, requestedObservation, inspectedSlot);
+        if (!ModelObservation.isWorkGoal(goal)) { JsonArray history = new JsonArray(); dialogue.forEach(history::add); view.add("conversationHistory", history); }
+        if (skillBook != null) try { view.add("skillKnowledge", skillBook.relevant(serverKey(), goal + " " + String.join(" ", feedback), view.get("observationMode").getAsString())); }
+        catch (java.io.IOException e) { LOG.warn("Could not read bounded experience: {}", e.getClass().getSimpleName()); }
         requestedObservation.clear(); inspectedSlot = null;
         plannerCharacters = view.toString().length();
         LOG.info("Planner view: mode={}, characters={}", view.get("observationMode"), plannerCharacters);
@@ -268,10 +319,6 @@ public final class PartnerClient implements ClientModInitializer {
         }
         ui.tick();
         if (!control.enabled() || mc.gui.screen() instanceof PartnerPanel || mc.isPaused()) return;
-        if (mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen) {
-            if (pending != null || !actions.isEmpty() || motor.busy() || harvest.busy()) { invalidateRequest(); motor.stop(); }
-            return; // The local user owns chat input while typing; do not plan doomed world actions.
-        }
         if (ScreenPolicy.blocksWorld(mc.gui.screen()) && motor.busy()) {
             motor.stop(); actions.clear(); rememberResult("World task interrupted by UI; inspect and operate the current screen before continuing.");
         }
@@ -285,6 +332,15 @@ public final class PartnerClient implements ClientModInitializer {
             return;
         }
         for (String result : motor.drainResults()) {
+            if (result.startsWith("SURVIVAL INTERRUPT")) { invalidateRequest(); manualMoveTarget = null; }
+            int urgency = mc.player.getHealth() <= 6 ? 3 : 2;
+            if (result.startsWith("NEED_HELP") && (ticks >= nextHelpRequest || urgency > helpUrgency)) {
+                nextHelpRequest = ticks + 1200;
+                helpUrgency = urgency;
+                String peer = mc.getConnection() == null ? "" : mc.getConnection().getOnlinePlayers().stream()
+                        .map(p -> p.getProfile().name()).filter(name -> !name.equalsIgnoreCase(mc.player.getGameProfile().name())).findFirst().orElse("");
+                say((peer.isEmpty() ? "" : "@" + peer + " ") + (result.contains("food") ? "我缺吃的，血量或饥饿有危险。能给我一点食物吗？" : "我被困住了，找不到安全出口。能帮我打开一条路吗？"));
+            }
             if (result.startsWith("DEFENCE STARTED")) {
                 invalidateRequest();
                 if (manualMoveTarget != null) { manualMoveTarget = null; control.complete(); }
@@ -296,6 +352,20 @@ public final class PartnerClient implements ClientModInitializer {
             rememberResult(result);
             if (manualMoveTarget != null && result.startsWith("FAILED")) { manualMoveTarget = null; control.complete(); notice(result); }
         }
+        if (motor.defending() && mc.player.getHealth() <= 6 && !motor.hasFood() && (ticks >= nextHelpRequest || helpUrgency < 3)) {
+            nextHelpRequest = ticks + 1200; helpUrgency = 3;
+            say("我血量很低，还缺食物，附近有人能帮我脱离战斗、给点补给吗？");
+        }
+        if (targetItem != null && motor.inventoryCount(targetItem) >= targetCount) {
+            if (targetStableTicks == 0) { invalidateRequest(); if (!motor.survivalBusy()) motor.stop(); }
+            if (++targetStableTicks >= 20) {
+                notice("采集数量已通过背包检查：" + targetItem + " × " + motor.inventoryCount(targetItem));
+                rememberResult("VERIFIED inventory quota: " + targetItem + " gained " + (motor.inventoryCount(targetItem) - targetStartCount));
+                targetItem = null; control.complete(); invalidateRequest(); nextDecision = ticks + 20;
+            }
+            return; // Stop gathering immediately, then verify across consecutive ticks.
+        }
+        targetStableTicks = 0;
         harvest.tick();
         String harvested = harvest.drainOutcome();
         if (harvested != null) { rememberResult("harvest_block: " + harvested); nextDecision = ticks + 20; }
@@ -305,12 +375,10 @@ public final class PartnerClient implements ClientModInitializer {
             if (movementStableTicks >= 20) { manualMoveTarget = null; control.complete(); motor.stop(); notice("本地移动已到达并稳定停下。"); }
             return; // A deterministic local movement does not need an LLM request.
         }
-        if (targetItem != null) {
-            targetStableTicks = motor.inventoryCount(targetItem) >= targetCount ? targetStableTicks + 1 : 0;
-            if (targetStableTicks >= 20) {
-                notice("采集数量已通过背包检查：" + targetItem + " × " + motor.inventoryCount(targetItem));
-                targetItem = null; control.complete(); invalidateRequest(); motor.stop(); nextDecision = ticks + 20;
-            }
+        configureQuantityTask();
+        if (targetItem != null && !motor.busy() && pending == null && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
+            JsonObject current = new JsonObject(); current.add("selfAndWorld", motor.snapshot(config.scanRadius));
+            if (startFallback(current)) return;
         }
         if (!motor.busy() && !actions.isEmpty()) {
             if (actionGeneration != control.generation()) { actions.clear(); return; }
@@ -318,7 +386,7 @@ public final class PartnerClient implements ClientModInitializer {
             try {
                 String result = perform(action);
                 rememberResult(action.tool() + ": " + result);
-                if (finishConversationAfterReply && control.publicGoal() && action.tool().equals("chat_say")
+                if (finishConversationAfterReply && (control.publicGoal() || control.localControl()) && action.tool().equals("chat_say")
                         && (result.startsWith("已发送") || result.startsWith("SKIPPED: public update"))) {
                     control.complete(); actions.clear(); finishConversationAfterReply = false;
                     rememberResult("Conversation answered through chat_say; proceeding to the next instruction.");
@@ -353,16 +421,16 @@ public final class PartnerClient implements ClientModInitializer {
                 return;
             }
             lastError = "";
-            finishConversationAfterReply = control.publicGoal() && observation.get("observationMode").getAsString().equals("conversation")
+            finishConversationAfterReply = (control.publicGoal() || control.localControl()) && !ModelObservation.isWorkGoal(goal)
                     && decision.actions().stream().anyMatch(action -> action.tool().equals("chat_say"))
                     && decision.actions().stream().allMatch(action -> action.tool().equals("chat_say") || action.tool().equals("complete_goal"));
-            boolean conversation = observation.get("observationMode").getAsString().equals("conversation");
+            boolean conversation = !ModelObservation.isWorkGoal(goal);
             boolean actionable = decision.actions().stream().anyMatch(action -> !List.of("chat_say", "remember", "wait", "complete_goal", "observe", "inspect_slot").contains(action.tool()));
             if (!decision.speech().isBlank()) {
                 if (conversation && !finishConversationAfterReply) say(decision.speech());
                 else notice(decision.speech().replaceAll("[\\r\\n]+", " "));
             }
-            if (control.publicGoal() && observation.get("observationMode").getAsString().equals("conversation")
+            if ((control.publicGoal() || control.localControl()) && conversation
                     && !decision.speech().isBlank() && decision.actions().isEmpty()) {
                 control.complete();
                 rememberResult("Conversation answered; proceeding to the next queued instruction.");
@@ -378,6 +446,23 @@ public final class PartnerClient implements ClientModInitializer {
     }
     private BlockPos position(JsonObject args) { return new BlockPos(args.get("x").getAsInt(), args.get("y").getAsInt(), args.get("z").getAsInt()); }
     /** Small recovery for autonomous/typed collection only; never substitutes an unrelated player's goal. */
+    private void configureQuantityTask() {
+        if (collectionGeneration == control.generation()) return;
+        collectionGeneration = control.generation();
+        if (targetItem != null || (!control.localControl() && !control.publicGoal())) return;
+        String text = control.goal(""); int addressed = text.indexOf("对你说：");
+        if (addressed >= 0) text = text.substring(addressed + 4).split("\n", 2)[0];
+        if (!text.matches("(?is).*(收|割|采|砍).*")) return;
+        if (text.contains("小麦")) targetItem = "minecraft:wheat";
+        else if (text.contains("胡萝卜")) targetItem = "minecraft:carrot";
+        else if (text.contains("马铃薯") || text.contains("土豆")) targetItem = "minecraft:potato";
+        if (targetItem == null) return;
+        int count = text.matches("(?is).*(全部|整片|这片|一组).*" ) ? 64 : 16;
+        var number = java.util.regex.Pattern.compile("(?:小麦|胡萝卜|土豆|马铃薯)\\s*([1-9][0-9]{0,2})|([1-9][0-9]{0,2})\\s*(?:个|份|组)").matcher(text);
+        if (number.find()) count = Math.clamp(Integer.parseInt(number.group(1) == null ? number.group(2) : number.group(1)), 1, 256);
+        targetStartCount = motor.inventoryCount(targetItem); targetCount = targetStartCount + count; targetStableTicks = 0; nextFallback = ticks;
+        rememberResult("Quantity task initialized: gather " + count + " new " + targetItem + "; continue the harvest skill until inventory verifies the quota.");
+    }
     private boolean startFallback(JsonObject observation) {
         String intent = control.goal(config.survivalGoal);
         int addressed = intent.indexOf("对你说：");
@@ -388,7 +473,7 @@ public final class PartnerClient implements ClientModInitializer {
         if (ticks < nextFallback || ScreenPolicy.blocksWorld(mc.gui.screen()) || motor.busy()
                 || mc.player.getHealth() <= 6 || prohibited
                 || ((control.localControl() || control.publicGoal()) && targetItem == null && !woodRequest && !cropRequest)) return false;
-        nextFallback = ticks + 200;
+        nextFallback = ticks + (targetItem == null ? 200 : 10);
         JsonArray blocks = observation.getAsJsonObject("selfAndWorld").getAsJsonArray("visibleBlocks");
         if (blocks == null) return false;
         java.util.ArrayList<BlockPos> candidates = new java.util.ArrayList<>();
@@ -399,11 +484,18 @@ public final class PartnerClient implements ClientModInitializer {
             boolean wanted = targetItem != null ? id.equals(targetItem)
                     : (woodRequest || (!control.localControl() && !control.publicGoal()))
                         && state.is(net.minecraft.tags.BlockTags.LOGS) && motor.inventoryCount(id) < 24;
+            if (targetItem != null && targetItem.equals("minecraft:carrot") && state.is(net.minecraft.world.level.block.Blocks.CARROTS)) wanted = true;
+            if (targetItem != null && targetItem.equals("minecraft:potato") && state.is(net.minecraft.world.level.block.Blocks.POTATOES)) wanted = true;
             if (targetItem == null && cropRequest && state.getBlock() instanceof net.minecraft.world.level.block.CropBlock crop && crop.isMaxAge(state)) wanted = true;
+            if (state.getBlock() instanceof net.minecraft.world.level.block.CropBlock crop && !crop.isMaxAge(state)) wanted = false;
             if (wanted) candidates.add(pos);
+        }
+        if (targetItem != null) for (var value : motor.cropTargets(targetItem, config.scanRadius)) {
+            BlockPos pos = position(value.getAsJsonObject()); if (!candidates.contains(pos)) candidates.add(pos);
         }
         candidates.sort(java.util.Comparator.comparingDouble(pos -> mc.player.distanceToSqr(net.minecraft.world.phys.Vec3.atCenterOf(pos))));
         for (BlockPos pos : candidates) {
+            askForMissingTool(pos);
             String result = harvest.start(pos);
             if (result.startsWith("STARTED")) {
                 actions.clear(); narrationOnlyDecisions = 0;
@@ -414,6 +506,21 @@ public final class PartnerClient implements ClientModInitializer {
         }
         return false;
     }
+    private void askForMissingTool(BlockPos position) {
+        if (ticks < nextHelpRequest || mc.getConnection() == null) return;
+        var block = mc.level.getBlockState(position); boolean axe = false, correct = false;
+        for (int slot = 0; slot < 36; slot++) {
+            var item = mc.player.getInventory().getItem(slot);
+            axe |= item.is(net.minecraft.tags.ItemTags.AXES); correct |= item.isCorrectToolForDrops(block);
+        }
+        String tool = block.is(net.minecraft.tags.BlockTags.LOGS) && !axe ? "斧子" : block.requiresCorrectToolForDrops() && !correct ? "合适的镐" : "";
+        if (tool.isEmpty()) return;
+        String peer = mc.getConnection().getOnlinePlayers().stream().map(p -> p.getProfile().name()).filter(name -> !name.equalsIgnoreCase(mc.player.getGameProfile().name())).findFirst().orElse("");
+        if (peer.isEmpty()) return;
+        nextHelpRequest = ticks + 1200; helpUrgency = 1;
+        say("@" + peer + " 我缺一把" + tool + "，能借我用一下吗？");
+        rememberResult("SUPPLY REQUEST: asked an online player for " + tool + "; continue only feasible work and inspect actual gifts.");
+    }
     private String perform(AiBrain.Action action) throws Exception {
         requireEnabled(); JsonObject args = action.args();
         modelActionActive = true;
@@ -421,14 +528,31 @@ public final class PartnerClient implements ClientModInitializer {
             case "move_to" -> motor.moveTo(position(args));
             case "follow_player" -> motor.follow(args.get("name").getAsString());
             case "collect_nearby" -> motor.collect();
-            case "open_inventory" -> { mc.gui.setScreen(new InventoryScreen(mc.player)); yield "OPENED: inspect current inventory slots"; }
+            case "open_inventory" -> {
+                String purpose = args.has("purpose") ? args.get("purpose").getAsString() : "";
+                boolean explicit = (control.localControl() || control.publicGoal()) && control.goal("").matches("(?is).*(整理|合成|制作|装备|穿上|背包).*" );
+                int occupied = 0; for (int slot = 0; slot < 36; slot++) if (!mc.player.getInventory().getItem(slot).isEmpty()) occupied++;
+                String rejection = inventoryPolicy.rejection(purpose, ticks, explicit, occupied >= 32);
+                if (rejection != null) yield rejection;
+                if (mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen) yield "SKIPPED: preserve the owner's current chat draft; craft after typing ends";
+                inventoryPolicy.opened(ticks); mc.gui.setScreen(new InventoryScreen(mc.player));
+                yield "OPENED: perform the requested " + purpose + " operations, then close; counts do not need reopening";
+            }
             case "dig_block" -> motor.dig(position(args));
             case "harvest_block" -> harvest.start(position(args));
+            case "collect_resource" -> {
+                String item = args.get("item").getAsString(); int count = args.get("count").getAsInt();
+                if (!net.minecraft.core.registries.BuiltInRegistries.ITEM.containsKey(Identifier.parse(item)) || count < 1 || count > 256) yield "FAILED: use a known item id and count 1–256";
+                targetItem = item; targetStartCount = motor.inventoryCount(item); targetCount = targetStartCount + count; targetStableTicks = 0; nextFallback = ticks;
+                yield "STARTED: continuous collection of " + count + " new " + item + "; verify stable inventory quota";
+            }
             case "place_block" -> motor.place(position(args), args.get("face").getAsString());
             case "select_hotbar" -> motor.select(args.get("slot").getAsInt());
             case "eat" -> motor.eat();
+            case "use_healing_item" -> motor.useHealingItem();
             case "use_block" -> motor.useBlock(position(args));
             case "attack_nearest" -> motor.attack();
+            case "escape" -> motor.escape();
             case "ui_click_slot" -> ui.clickSlot(args.get("slot").getAsInt(), args.get("button").getAsString(), args.get("revision").getAsLong());
             case "ui_click_chat" -> ui.clickChat(args.get("id").getAsInt());
             case "ui_input_chat" -> ui.inputChat(args.get("text").getAsString());
@@ -436,8 +560,8 @@ public final class PartnerClient implements ClientModInitializer {
                 if (ui.snapshot().get("revision").getAsLong() != args.get("revision").getAsLong()) yield "FAILED: stale UI revision";
                 yield ui.screenAction(args.get("index").getAsInt(), args.get("value").getAsString());
             }
-            case "ui_close" -> mc.gui.screen() instanceof net.minecraft.client.gui.screens.PauseScreen
-                    ? "SKIPPED: the owner's local Esc overlay remains open; world controls are available" : ui.closeUi();
+            case "ui_close" -> mc.gui.screen() instanceof net.minecraft.client.gui.screens.PauseScreen || mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen
+                    ? "SKIPPED: the owner's local overlay remains open; world controls are available" : ui.closeUi();
             case "observe" -> {
                 String area = args.get("area").getAsString().toLowerCase(java.util.Locale.ROOT);
                 if (!java.util.Set.of("world", "inventory", "hud", "chat", "menu").contains(area)) yield "FAILED: unknown observation area";
@@ -461,9 +585,13 @@ public final class PartnerClient implements ClientModInitializer {
             }
             case "remember" -> {
                 String note = args.get("text").getAsString(); if (note.length() > 400) yield "FAILED: note too long";
+                if (note.matches("(?is).*(item_display|物品展示|展示方块|展示实体).*(无法|不能|不是真的|没有真正|假的).*"))
+                    yield "FAILED: entity type cannot prove that plugin crops are fake or unharvestable. Only persist verified interaction/item outcomes.";
                 config.notes = (config.notes + "\n" + note).strip(); if (config.notes.length() > 4000) config.notes = config.notes.substring(config.notes.length() - 4000);
                 config.save(); yield "OK: note saved";
             }
+            case "learn_skill" -> skillBook == null ? "FAILED: skill library is unavailable"
+                    : skillBook.learn(serverKey(), args.get("topic").getAsString(), args.get("knowledge").getAsString());
             default -> "FAILED: unknown tool";
         }; } finally { modelActionActive = false; }
     }

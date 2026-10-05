@@ -10,6 +10,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
@@ -21,6 +22,10 @@ import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -54,6 +59,10 @@ public final class ClientMotor {
     private boolean active;
     private Vec3 destination;
     private final int range;
+    private final ArrayDeque<BlockPos> escapeBlocks = new ArrayDeque<>();
+    private BlockPos escapeExit;
+    private boolean escaping;
+    private int survivalTicks, escapeCooldown, foodRetry;
     private boolean defending;
     private boolean retreating;
     private int defenceQuietTicks;
@@ -62,8 +71,9 @@ public final class ClientMotor {
     private float lastHealth = Float.NaN;
 
     public ClientMotor(Minecraft mc, int range) { this.mc = mc; this.range = range; }
-    public boolean busy() { return defending || !route.isEmpty() || digging != null || eatingTicks > 0 || collecting != null || following != null; }
+    public boolean busy() { return escaping || defending || !route.isEmpty() || digging != null || eatingTicks > 0 || collecting != null || following != null; }
     public boolean defending() { return defending; }
+    public boolean survivalBusy() { return defending || escaping || eatingTicks > 0; }
     public Vec3 destination() { return destination; }
     public String status() { return defending ? retreating ? "defending: retreating" : "defending: fighting" : digging != null ? "digging " + digging : eatingTicks > 0 ? "eating" : following != null ? "following " + following : !route.isEmpty() ? "walking " + route.size() : "idle"; }
     public int inventoryCount(String id) {
@@ -79,6 +89,7 @@ public final class ClientMotor {
     private void result(String value) { results.addLast(value); while (results.size() > 16) results.removeFirst(); }
     public List<String> drainResults() { List<String> values = List.copyOf(results); results.clear(); return values; }
     public void stop() {
+        escaping = false; escapeBlocks.clear(); escapeExit = null;
         route.clear(); destination = null; digging = null; diggingConfirmed = null; following = null; collecting = null;
         eatingTicks = 0; taskTicks = 0; stillTicks = 0; followTicks = 0;
         defending = false; retreating = false; defenceQuietTicks = 0; recentDamageTicks = 0;
@@ -185,6 +196,9 @@ public final class ClientMotor {
     }
     public String dig(BlockPos position) {
         ready(); if (busy()) return "FAILED: physical task already active";
+        return beginDig(position);
+    }
+    private String beginDig(BlockPos position) {
         BlockHitResult hit = visibleHit(position);
         if (hit == null) return "FAILED: block is not visible in current reach; move closer first";
         BlockState state = mc.level.getBlockState(position);
@@ -224,15 +238,57 @@ public final class ClientMotor {
     public String eat() {
         ready(); if (busy()) return "FAILED: physical task active";
         if (!mc.player.getFoodData().needsFood()) return "OK: not hungry";
-        for (int slot = 0; slot < 9; slot++) {
+        for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = mc.player.getInventory().getItem(slot);
-            if (stack.has(DataComponents.FOOD)) {
-                restoreSlot = mc.player.getInventory().getSelectedSlot(); mc.player.getInventory().setSelectedSlot(slot);
+            if (safeFood(stack)) {
+                int hotbar = slot;
+                if (slot >= 9) {
+                    if (mc.player.containerMenu != mc.player.inventoryMenu) return "FAILED: close the container before eating from main inventory";
+                    hotbar = 8;
+                    for (int empty = 0; empty < 9; empty++) if (mc.player.getInventory().getItem(empty).isEmpty()) { hotbar = empty; break; }
+                    mc.gameMode.handleContainerInput(mc.player.inventoryMenu.containerId, slot, hotbar, ContainerInput.SWAP, mc.player);
+                }
+                restoreSlot = mc.player.getInventory().getSelectedSlot(); mc.player.getInventory().setSelectedSlot(hotbar);
                 mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND); eatingTicks = 60;
-                return "STARTED: eating from hotbar";
+                return "STARTED: eating existing food without opening inventory";
             }
         }
-        return "FAILED: no food in hotbar; move food to hotbar through inventory UI";
+        return "FAILED: no safe food in inventory; ask players for food";
+    }
+    private boolean safeFood(ItemStack stack) {
+        return stack.has(DataComponents.FOOD) && !stack.is(Items.ROTTEN_FLESH) && !stack.is(Items.PUFFERFISH)
+                && !stack.is(Items.SPIDER_EYE) && !stack.is(Items.POISONOUS_POTATO) && !stack.is(Items.CHICKEN) && !stack.is(Items.SUSPICIOUS_STEW);
+    }
+    public boolean hasFood() {
+        if (mc.player == null) return false;
+        for (int slot = 0; slot < 36; slot++) if (safeFood(mc.player.getInventory().getItem(slot))) return true;
+        return false;
+    }
+    private boolean healingPotion(ItemStack stack) {
+        if (!stack.is(Items.POTION)) return false;
+        var contents = stack.get(DataComponents.POTION_CONTENTS); if (contents == null) return false;
+        boolean heals = false;
+        for (var effect : contents.getAllEffects()) {
+            if (effect.getEffect().value().getCategory() == net.minecraft.world.effect.MobEffectCategory.HARMFUL) return false;
+            if (effect.getEffect().equals(net.minecraft.world.effect.MobEffects.INSTANT_HEALTH) || effect.getEffect().equals(net.minecraft.world.effect.MobEffects.REGENERATION)) heals = true;
+        }
+        return heals;
+    }
+    public String useHealingItem() {
+        ready(); if (busy()) return "FAILED: physical task active";
+        for (int slot = 0; slot < 36; slot++) if (healingPotion(mc.player.getInventory().getItem(slot))) {
+            int hotbar = slot;
+            if (slot >= 9) {
+                if (mc.player.containerMenu != mc.player.inventoryMenu) return "FAILED: finish the open container first";
+                hotbar = 8;
+                for (int empty = 0; empty < 9; empty++) if (mc.player.getInventory().getItem(empty).isEmpty()) { hotbar = empty; break; }
+                mc.gameMode.handleContainerInput(mc.player.inventoryMenu.containerId, slot, hotbar, ContainerInput.SWAP, mc.player);
+            }
+            restoreSlot = mc.player.getInventory().getSelectedSlot(); mc.player.getInventory().setSelectedSlot(hotbar);
+            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND); eatingTicks = 60;
+            return "STARTED: using an existing safe healing/regeneration potion; verify server health";
+        }
+        return "FAILED: no safe healing potion in inventory";
     }
     private void restoreFoodSlot() { if (restoreSlot >= 0 && mc.player != null) mc.player.getInventory().setSelectedSlot(restoreSlot); restoreSlot = -1; }
     public void serverBlockUpdate(BlockPos position, BlockState state) {
@@ -265,13 +321,18 @@ public final class ClientMotor {
         int selected = mc.player.getInventory().getSelectedSlot();
         int best = selected;
         double damage = weaponDamage(mc.player.getInventory().getItem(selected));
-        for (int slot = 0; slot < 9; slot++) {
+        for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = mc.player.getInventory().getItem(slot);
             if (!(stack.is(ItemTags.SWORDS) || stack.is(ItemTags.AXES))) continue;
             double candidate = weaponDamage(stack);
             if (candidate > damage) { best = slot; damage = candidate; }
         }
-        if (best != selected) { restoreCombatSlot = selected; mc.player.getInventory().setSelectedSlot(best); }
+        if (best >= 9 && mc.player.containerMenu == mc.player.inventoryMenu) {
+            int hotbar = 8;
+            for (int empty = 0; empty < 9; empty++) if (mc.player.getInventory().getItem(empty).isEmpty()) { hotbar = empty; break; }
+            mc.gameMode.handleContainerInput(mc.player.inventoryMenu.containerId, best, hotbar, ContainerInput.SWAP, mc.player); best = hotbar;
+        }
+        if (best < 9 && best != selected) { restoreCombatSlot = selected; mc.player.getInventory().setSelectedSlot(best); }
     }
     private double weaponDamage(ItemStack stack) {
         var modifiers = stack.get(DataComponents.ATTRIBUTE_MODIFIERS);
@@ -279,6 +340,7 @@ public final class ClientMotor {
     }
     /** Runs before planning and physical work, so a pending HTTP request cannot delay self-defence. */
     private boolean defend() {
+        if (escaping) return false; // Clearing an exit is part of the same emergency, not a competing fight.
         float health = mc.player.getHealth();
         if (!Float.isNaN(lastHealth) && health < lastHealth) recentDamageTicks = 60;
         else if (recentDamageTicks > 0) recentDamageTicks--;
@@ -318,6 +380,13 @@ public final class ClientMotor {
                 float yaw = (float) Math.toDegrees(Math.atan2(-direction.x, direction.z));
                 if (Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - mc.player.getYRot())) < 35) mc.options.keyUp.setDown(true);
                 if (escape.height > mc.player.getY() + .2) mc.options.keyJump.setDown(true);
+                if (mc.player.getFoodData().getFoodLevel() > 6) mc.options.keySprint.setDown(true);
+            } else if (surrounded()) {
+                defending = false;
+                String opened = escape();
+                if (opened.startsWith("STARTED")) return false;
+                defending = true;
+                result("NEED_HELP: threatened and trapped without a safe breakable exit");
             }
             return true;
         }
@@ -351,6 +420,88 @@ public final class ClientMotor {
         String result = moveTo(closest.blockPosition()); if (result.startsWith("FAILED")) return result;
         collecting = closest.getUUID(); return "STARTED: walking to dropped item; normal server pickup applies";
     }
+    /** Bounded local escape: clear a cheap reachable obstruction, never a container or unsafe floor. */
+    public String escape() {
+        ready(); if (busy()) return "FAILED: physical task active";
+        Stand start = nearFoot(mc.player.blockPosition(), mc.player.getY());
+        if (start == null) return "FAILED: no safe current standing surface";
+        BlockPos feet = BlockPos.containing(mc.player.getX(), Math.floor(mc.player.getY() + .1), mc.player.getZ());
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            Stand exit = nearFoot(feet.relative(direction, 2), mc.player.getY());
+            if (exit == null || !stepAllowed(start, exit)) continue;
+            BlockPos lower = feet.relative(direction), upper = lower.above();
+            ArrayDeque<BlockPos> breakable = new ArrayDeque<>(); boolean safe = true;
+            for (BlockPos block : List.of(upper, lower)) {
+                BlockState state = mc.level.getBlockState(block);
+                if (state.getCollisionShape(mc.level, block).isEmpty()) continue;
+                if (state.hasBlockEntity() || hazard(state) || !state.getFluidState().isEmpty()
+                        || state.getBlock() instanceof FallingBlock || mc.level.getBlockState(block.above()).getBlock() instanceof FallingBlock
+                        || state.is(Blocks.TNT) || state.getDestroySpeed(mc.level, block) < 0 || state.getDestroySpeed(mc.level, block) > 3) { safe = false; break; }
+                if (visibleHit(block) == null && !(block.equals(lower) && breakable.contains(upper))) { safe = false; break; }
+                breakable.add(block.immutable());
+            }
+            if (!safe || breakable.isEmpty()) continue;
+            stop(); escaping = true; escapeBlocks.addAll(breakable); escapeExit = BlockPos.containing(exit.center());
+            result("SURVIVAL INTERRUPT: clearing a reachable obstruction to escape");
+            return "STARTED: bounded escape mining; await server confirmation and movement";
+        }
+        return "FAILED: no safe breakable escape opening; ask a player for help";
+    }
+    private boolean surrounded() {
+        Stand start = nearFoot(mc.player.blockPosition(), mc.player.getY()); if (start == null) return false;
+        for (Direction direction : Direction.Plane.HORIZONTAL) for (int dy = -1; dy <= 1; dy++)
+            if (stepAllowed(start, stand(start.floor.relative(direction).offset(0, dy, 0)))) return false;
+        return true;
+    }
+    private boolean survival() {
+        survivalTicks++;
+        if (foodRetry > 0) foodRetry--;
+        if (escapeCooldown > 0) escapeCooldown--;
+        if (mc.player.getHealth() <= 10 && eatingTicks == 0 && foodRetry == 0 && !escaping) {
+            boolean available = false; for (int slot = 0; slot < 36; slot++) if (healingPotion(mc.player.getInventory().getItem(slot))) { available = true; break; }
+            if (available) {
+                stop(); String healing = useHealingItem(); foodRetry = 60;
+                if (healing.startsWith("STARTED")) { result("SURVIVAL INTERRUPT: using existing healing supplies; wait for real server health"); return true; }
+            }
+        }
+        boolean needFood = mc.player.getFoodData().getFoodLevel() <= 14 || mc.player.getHealth() <= 12 && mc.player.getFoodData().needsFood();
+        if (needFood && eatingTicks == 0 && foodRetry == 0 && !escaping) {
+            if (hasFood()) {
+                stop(); String food = eat(); foodRetry = 20;
+                if (food.startsWith("STARTED")) { result("SURVIVAL INTERRUPT: eating existing safe food; server health/hunger will confirm recovery"); return true; }
+            } else {
+                ItemEntity food = null; double distance = 8;
+                for (Entity entity : mc.level.entitiesForRendering()) if (entity instanceof ItemEntity item && safeFood(item.getItem()) && mc.player.hasLineOfSight(item) && mc.player.distanceTo(item) < distance) { food = item; distance = mc.player.distanceTo(item); }
+                if (food != null && route.isEmpty()) {
+                    stop(); String walked = moveTo(food.blockPosition());
+                    if (walked.startsWith("STARTED")) { collecting = food.getUUID(); foodRetry = 60; result("SURVIVAL INTERRUPT: walking to visible dropped food"); return true; }
+                }
+                foodRetry = 100;
+                if (survivalTicks % 100 == 0 || mc.player.getHealth() <= 6) result("NEED_HELP: no safe food in inventory; low health/food needs supplies");
+            }
+        }
+        if (escaping && digging == null && route.isEmpty()) {
+            while (!escapeBlocks.isEmpty() && mc.level.getBlockState(escapeBlocks.peekFirst()).getCollisionShape(mc.level, escapeBlocks.peekFirst()).isEmpty()) escapeBlocks.removeFirst();
+            if (!escapeBlocks.isEmpty()) {
+                String mined = beginDig(escapeBlocks.removeFirst());
+                if (!mined.startsWith("STARTED")) { stop(); result(mined); escapeCooldown = 200; }
+                return true;
+            }
+            BlockPos exit = escapeExit;
+            if (mc.player.position().distanceTo(Vec3.atBottomCenterOf(exit)) < .8) {
+                escaping = false; escapeExit = null; escapeCooldown = 200; result("OK: escaped through a server-confirmed opening"); return true;
+            }
+            escaping = false; String moved = moveTo(exit);
+            if (moved.startsWith("STARTED")) { escaping = true; escapeExit = exit; }
+            result("Escape opening cleared; " + moved); escapeCooldown = 200; return true;
+        }
+        if (!busy() && escapeCooldown == 0 && surrounded()) {
+            String freed = escape(); escapeCooldown = 200;
+            if (freed.startsWith("STARTED")) return true;
+            result("NEED_HELP: trapped without a safe breakable exit");
+        }
+        return false;
+    }
     public void tick() {
         if (!active) return;
         releaseKeys();
@@ -358,6 +509,7 @@ public final class ClientMotor {
         if (ScreenPolicy.blocksWorld(mc.gui.screen())) return;
         if (mc.player.isInWater() && mc.player.getAirSupply() < 120) { mc.options.keyJump.setDown(true); mc.options.keyUp.setDown(false); return; }
         if (defend()) return;
+        if (survival()) return;
         if (eatingTicks > 0) {
             eatingTicks--; mc.options.keyUse.setDown(true);
             if (eatingTicks < 55 && !mc.player.isUsingItem()) { eatingTicks = 0; restoreFoodSlot(); result("Eating ended; current food level=" + mc.player.getFoodData().getFoodLevel()); }
@@ -464,28 +616,96 @@ public final class ClientMotor {
         state.addProperty("task", status()); state.addProperty("hotbarSlot", mc.player.getInventory().getSelectedSlot());
         state.add("safeDestinations", safeDestinations(radius));
         JsonArray blocks = new JsonArray(); BlockPos origin = mc.player.blockPosition();
+        ArrayList<BlockPos> resources = new ArrayList<>();
         for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-radius, -3, -radius), origin.offset(radius, 5, radius))) {
             if (!mc.level.hasChunkAt(pos)) continue;
             BlockState block = mc.level.getBlockState(pos);
             if (block.isAir()) continue;
             String id = BuiltInRegistries.BLOCK.getKey(block.getBlock()).toString();
             if (!(block.is(BlockTags.LOGS) || block.is(BlockTags.CROPS) || id.contains("ore") || id.contains("chest") || id.contains("crafting") || id.contains("furnace") || id.contains("farmland"))) continue;
-            // Only a ray-visible surface is exposed; hidden ore is never reported.
+            resources.add(pos.immutable());
+        }
+        resources.sort(Comparator.comparingDouble(pos -> mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(pos))));
+        for (BlockPos pos : resources) {
+            BlockState block = mc.level.getBlockState(pos); String id = BuiltInRegistries.BLOCK.getKey(block.getBlock()).toString();
+            // Sort before capping: a large field must not fill observations with the far corner.
             BlockHitResult hit = mc.level.clip(new ClipContext(mc.player.getEyePosition(), Vec3.atCenterOf(pos), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
             if (!hit.getBlockPos().equals(pos)) continue;
             JsonObject entry = new JsonObject(); entry.addProperty("id", id); entry.addProperty("x", pos.getX()); entry.addProperty("y", pos.getY()); entry.addProperty("z", pos.getZ()); entry.addProperty("state", block.toString()); blocks.add(entry);
+            entry.addProperty("distance", Math.round(mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos)) * 10) / 10.0);
+            entry.addProperty("reachable", visibleHit(pos) != null);
+            if (block.getBlock() instanceof CropBlock crop) entry.addProperty("mature", crop.isMaxAge(block));
             if (blocks.size() >= 48) break;
         }
         state.add("visibleBlocks", blocks);
         JsonArray entities = new JsonArray();
         for (Entity entity : mc.level.entitiesForRendering()) {
-            if (entity == mc.player || mc.player.distanceTo(entity) > radius * 2 || !mc.player.hasLineOfSight(entity)) continue;
+            if (entity == mc.player || mc.player.distanceTo(entity) > radius * 2 || !visibleEntity(entity)) continue;
             JsonObject entry = new JsonObject(); entry.addProperty("name", entity.getName().getString()); entry.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
+            if (entity instanceof Display.ItemDisplay display) {
+                ItemStack stack = ((dev.mcai.partner.mixin.motor.DisplayItemAccessor)display).wildling$item();
+                JsonObject item = new JsonObject(); item.addProperty("id", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString()); item.addProperty("name", stack.getHoverName().getString());
+                if (stack.has(DataComponents.CUSTOM_MODEL_DATA)) item.addProperty("customModelData", String.valueOf(stack.get(DataComponents.CUSTOM_MODEL_DATA)));
+                entry.add("displayItem", item); addBackingBlock(entry, entity.blockPosition());
+            }
+            if (entity instanceof Display.BlockDisplay display) {
+                BlockState displayed = ((dev.mcai.partner.mixin.motor.DisplayBlockAccessor)display).wildling$block();
+                entry.addProperty("displayBlock", BuiltInRegistries.BLOCK.getKey(displayed.getBlock()).toString()); addBackingBlock(entry, entity.blockPosition());
+            }
             entry.addProperty("distance", Math.round(mc.player.distanceTo(entity) * 10) / 10.0);
             entry.addProperty("hostile", entity instanceof Mob mob && hostile(mob));
             if (entity instanceof LivingEntity living) entry.addProperty("health", living.getHealth());
             entry.addProperty("x", entity.getX()); entry.addProperty("y", entity.getY()); entry.addProperty("z", entity.getZ()); entities.add(entry); if (entities.size() >= 24) break;
         }
-        state.add("visibleEntities", entities); return state;
+        state.add("visibleEntities", entities); state.add("customCropTargets", cropTargets("", radius)); return state;
+    }
+    private void addBackingBlock(JsonObject entry, BlockPos position) {
+        for (int dy = 0; dy >= -1; dy--) {
+            BlockPos block = position.offset(0, dy, 0); if (visibleHitOrFar(block) == null) continue;
+            BlockState state = mc.level.getBlockState(block); if (state.isAir()) continue;
+            JsonObject backing = new JsonObject(); backing.addProperty("id", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+            backing.addProperty("x", block.getX()); backing.addProperty("y", block.getY()); backing.addProperty("z", block.getZ()); entry.add("backingBlock", backing); return;
+        }
+    }
+    private boolean visibleEntity(Entity entity) {
+        if (mc.player.hasLineOfSight(entity)) return true;
+        if (!(entity instanceof Display display)) return false;
+        Vec3 point = entity.position();
+        if (display.renderState() != null) {
+            var translation = display.renderState().transformation().get(1).translation();
+            point = point.add(translation.x(), translation.y(), translation.z());
+        }
+        var hit = mc.level.clip(new ClipContext(mc.player.getEyePosition(), point.add(0, .25, 0), ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, mc.player));
+        // Custom crops can render inside the logical note-block proxy. Hitting that visible
+        // backing surface is not the same as an unrelated opaque wall hiding the display.
+        return hit.getType() == HitResult.Type.MISS || hit.getBlockPos().equals(entity.blockPosition()) || hit.getBlockPos().equals(entity.blockPosition().below());
+    }
+    private BlockHitResult visibleHitOrFar(BlockPos position) {
+        if (!mc.level.hasChunkAt(position)) return null;
+        BlockHitResult hit = mc.level.clip(new ClipContext(mc.player.getEyePosition(), Vec3.atCenterOf(position), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
+        return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(position) ? hit : null;
+    }
+    public JsonArray cropTargets(String requestedItem, int radius) {
+        JsonArray targets = new JsonArray(); if (mc.player == null || mc.level == null) return targets;
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (!(entity instanceof Display.ItemDisplay display) || mc.player.distanceTo(entity) > radius * 2 || !visibleEntity(entity)) continue;
+            ItemStack stack = ((dev.mcai.partner.mixin.motor.DisplayItemAccessor)display).wildling$item();
+            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), name = stack.getHoverName().getString();
+            String cropItem = id.equals("minecraft:wheat") || name.contains("小麦") ? "minecraft:wheat"
+                    : id.equals("minecraft:carrot") || name.contains("胡萝卜") ? "minecraft:carrot"
+                    : id.equals("minecraft:potato") || name.contains("土豆") || name.contains("马铃薯") ? "minecraft:potato" : "";
+            if (cropItem.isEmpty() || !requestedItem.isEmpty() && !requestedItem.equals(cropItem)) continue;
+            for (int dy = 0; dy >= -1; dy--) {
+                BlockPos position = entity.blockPosition().offset(0, dy, 0); BlockState backing = mc.level.getBlockState(position);
+                if (!(backing.getBlock() instanceof CropBlock) && !backing.is(Blocks.NOTE_BLOCK) && !backing.is(Blocks.TRIPWIRE)) continue;
+                if (backing.isAir() || backing.hasBlockEntity() || hazard(backing) || !backing.getFluidState().isEmpty()) continue;
+                if (backing.getBlock() instanceof CropBlock crop && !crop.isMaxAge(backing)) continue;
+                if (!(backing.getBlock() instanceof CropBlock) && visibleHitOrFar(position) == null) continue;
+                JsonObject target = new JsonObject(); target.addProperty("item", cropItem); target.addProperty("logicalBlock", BuiltInRegistries.BLOCK.getKey(backing.getBlock()).toString());
+                target.addProperty("x", position.getX()); target.addProperty("y", position.getY()); target.addProperty("z", position.getZ()); targets.add(target); break;
+            }
+            if (targets.size() >= 32) break;
+        }
+        return targets;
     }
 }
