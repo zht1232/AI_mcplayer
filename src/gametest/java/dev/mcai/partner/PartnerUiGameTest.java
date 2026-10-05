@@ -44,6 +44,7 @@ import net.minecraft.world.item.Items;
 public final class PartnerUiGameTest implements FabricClientGameTest {
     private static void check(boolean value, String message) { if (!value) throw new AssertionError(message); }
     @Override public void runTest(ClientGameTestContext context) {
+        if (NaturalSurvivalSoak.minutes() > 0) { NaturalSurvivalSoak.run(context); return; }
         context.runOnClient(mc -> {
             check(PartnerClient.instance() != null, "client entrypoint did not load");
             check(!PartnerClient.instance().enabled(), "AI must start disabled");
