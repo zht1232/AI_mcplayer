@@ -25,7 +25,7 @@ final class NaturalSurvivalSoak {
         try {
             Files.createDirectories(reports);
             Path timeline = reports.resolve("timeline.jsonl"); Files.writeString(timeline, "", StandardCharsets.UTF_8);
-            try (TestDedicatedServerContext server = context.worldBuilder().createServer(properties);
+            try (TestDedicatedServerContext server = context.worldBuilder().setUseConsistentSettings(false).createServer(properties);
                  TestDedicatedServerConnection connection = server.connect()) {
                 connection.waitForChunksDownload();
                 context.runOnClient(mc -> {
