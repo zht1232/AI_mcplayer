@@ -10,8 +10,16 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.NeutralMob;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.monster.piglin.AbstractPiglin;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Blocks;
@@ -46,11 +54,18 @@ public final class ClientMotor {
     private boolean active;
     private Vec3 destination;
     private final int range;
+    private boolean defending;
+    private boolean retreating;
+    private int defenceQuietTicks;
+    private int recentDamageTicks;
+    private int restoreCombatSlot = -1;
+    private float lastHealth = Float.NaN;
 
     public ClientMotor(Minecraft mc, int range) { this.mc = mc; this.range = range; }
-    public boolean busy() { return !route.isEmpty() || digging != null || eatingTicks > 0 || collecting != null || following != null; }
+    public boolean busy() { return defending || !route.isEmpty() || digging != null || eatingTicks > 0 || collecting != null || following != null; }
+    public boolean defending() { return defending; }
     public Vec3 destination() { return destination; }
-    public String status() { return digging != null ? "digging " + digging : eatingTicks > 0 ? "eating" : following != null ? "following " + following : !route.isEmpty() ? "walking " + route.size() : "idle"; }
+    public String status() { return defending ? retreating ? "defending: retreating" : "defending: fighting" : digging != null ? "digging " + digging : eatingTicks > 0 ? "eating" : following != null ? "following " + following : !route.isEmpty() ? "walking " + route.size() : "idle"; }
     public int inventoryCount(String id) {
         if (mc.player == null) return 0;
         int count = 0;
@@ -60,14 +75,15 @@ public final class ClientMotor {
         }
         return count;
     }
-    public void active(boolean enabled) { active = enabled; if (!enabled) stop(); }
+    public void active(boolean enabled) { active = enabled; lastHealth = Float.NaN; if (!enabled) stop(); }
     private void result(String value) { results.addLast(value); while (results.size() > 16) results.removeFirst(); }
     public List<String> drainResults() { List<String> values = List.copyOf(results); results.clear(); return values; }
     public void stop() {
         route.clear(); destination = null; digging = null; diggingConfirmed = null; following = null; collecting = null;
         eatingTicks = 0; taskTicks = 0; stillTicks = 0; followTicks = 0;
+        defending = false; retreating = false; defenceQuietTicks = 0; recentDamageTicks = 0;
         if (mc.gameMode != null) { mc.gameMode.stopDestroyBlock(); if (mc.player != null && mc.player.isUsingItem()) mc.gameMode.releaseUsingItem(mc.player); }
-        restoreFoodSlot(); releaseKeys();
+        restoreFoodSlot(); restoreCombatSlot(); releaseKeys();
     }
     private void releaseKeys() {
         mc.options.keyUp.setDown(false); mc.options.keyDown.setDown(false);
@@ -77,7 +93,7 @@ public final class ClientMotor {
     }
     private void ready() {
         if (!active || mc.level == null || mc.player == null || mc.gameMode == null || !mc.player.isAlive()) throw new IllegalStateException("AI 未开启或玩家不可行动");
-        if (mc.gui.screen() != null) throw new IllegalStateException("先关闭当前界面，再执行世界动作");
+        if (ScreenPolicy.blocksWorld(mc.gui.screen())) throw new IllegalStateException("先关闭当前界面，再执行世界动作");
     }
     private boolean hazard(BlockState state) {
         return state.is(Blocks.LAVA) || state.is(Blocks.FIRE) || state.is(Blocks.SOUL_FIRE)
@@ -226,7 +242,7 @@ public final class ClientMotor {
         ready(); if (busy()) return "FAILED: physical task active";
         Entity nearest = null; double distance = mc.player.entityInteractionRange();
         for (Entity entity : mc.level.entitiesForRendering()) {
-            if (!(entity instanceof Monster monster) || !monster.isAlive()) continue;
+            if (!(entity instanceof Mob mob) || !hostile(mob)) continue;
             double found = mc.player.distanceTo(entity);
             if (found < distance && mc.player.hasLineOfSight(entity)) { nearest = entity; distance = found; }
         }
@@ -234,6 +250,98 @@ public final class ClientMotor {
         if (mc.player.getAttackStrengthScale(0) < .9f) return "WAIT: attack cooldown";
         look(nearest.getEyePosition()); mc.gameMode.attack(mc.player, nearest); mc.player.swing(InteractionHand.MAIN_HAND);
         return "SENT: attack; inspect health and combat feedback";
+    }
+    /** Only client-visible hostile monsters are eligible. Players and peaceful neutral mobs are excluded. */
+    private boolean hostile(Mob mob) {
+        return mob instanceof Enemy && mob.isAlive()
+                && (!(mob instanceof NeutralMob) || mob.isAggressive())
+                && (!(mob instanceof AbstractPiglin) || mob.isAggressive());
+    }
+    private void restoreCombatSlot() {
+        if (restoreCombatSlot >= 0 && mc.player != null) mc.player.getInventory().setSelectedSlot(restoreCombatSlot);
+        restoreCombatSlot = -1;
+    }
+    private void selectCombatWeapon() {
+        int selected = mc.player.getInventory().getSelectedSlot();
+        int best = selected;
+        double damage = weaponDamage(mc.player.getInventory().getItem(selected));
+        for (int slot = 0; slot < 9; slot++) {
+            ItemStack stack = mc.player.getInventory().getItem(slot);
+            if (!(stack.is(ItemTags.SWORDS) || stack.is(ItemTags.AXES))) continue;
+            double candidate = weaponDamage(stack);
+            if (candidate > damage) { best = slot; damage = candidate; }
+        }
+        if (best != selected) { restoreCombatSlot = selected; mc.player.getInventory().setSelectedSlot(best); }
+    }
+    private double weaponDamage(ItemStack stack) {
+        var modifiers = stack.get(DataComponents.ATTRIBUTE_MODIFIERS);
+        return modifiers == null ? 1 : modifiers.compute(Attributes.ATTACK_DAMAGE, 1, EquipmentSlot.MAINHAND);
+    }
+    /** Runs before planning and physical work, so a pending HTTP request cannot delay self-defence. */
+    private boolean defend() {
+        float health = mc.player.getHealth();
+        if (!Float.isNaN(lastHealth) && health < lastHealth) recentDamageTicks = 60;
+        else if (recentDamageTicks > 0) recentDamageTicks--;
+        lastHealth = health;
+        Mob threat = null; double nearest = Double.MAX_VALUE;
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (!(entity instanceof Mob mob) || !hostile(mob) || !mc.player.hasLineOfSight(entity)) continue;
+            double distance = mc.player.distanceTo(entity);
+            double triggerRange = mob instanceof Creeper ? 4.5 : recentDamageTicks > 0 ? 6 : 3.5;
+            if (distance <= triggerRange && distance < nearest) { threat = mob; nearest = distance; }
+        }
+        if (threat == null) {
+            if (!defending) return false;
+            if (++defenceQuietTicks < 20) return true;
+            defending = false; retreating = false; restoreCombatSlot();
+            result("DEFENCE ENDED: no visible hostile in the immediate threat radius; re-observe before resuming work");
+            return false;
+        }
+        if (!defending) {
+            boolean interrupted = busy();
+            int damageMemory = recentDamageTicks;
+            stop(); recentDamageTicks = damageMemory; defending = true; selectCombatWeapon();
+            result("DEFENCE STARTED: immediate visible hostile; model request and queued world actions must be invalidated");
+            if (interrupted) result("FAILED: physical work interrupted for immediate self-defence; re-plan when safe");
+        }
+        defenceQuietTicks = 0;
+        retreating = health <= 6 || threat instanceof Creeper;
+        if (retreating) {
+            // Retreat only over a neighbouring dry, collision-free standing cell. Never back into an unseen drop.
+            Vec3 away = mc.player.position().subtract(threat.position()).multiply(1, 0, 1);
+            if (away.lengthSqr() < .01) away = new Vec3(1, 0, 0);
+            Vec3 direction = away.normalize();
+            Stand start = nearFoot(mc.player.blockPosition(), mc.player.getY());
+            Stand escape = nearFoot(BlockPos.containing(mc.player.position().add(direction.scale(1.2))), mc.player.getY());
+            if (start != null && stepAllowed(start, escape) && !start.floor.equals(escape.floor)) {
+                look(escape.center().add(0, mc.player.getEyeHeight(), 0));
+                float yaw = (float) Math.toDegrees(Math.atan2(-direction.x, direction.z));
+                if (Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - mc.player.getYRot())) < 35) mc.options.keyUp.setDown(true);
+                if (escape.height > mc.player.getY() + .2) mc.options.keyJump.setDown(true);
+            }
+            return true;
+        }
+        look(threat.getEyePosition());
+        // Normal vanilla range and attack cooldown apply, even though this is a local reflex.
+        boolean inReach = mc.player.isWithinEntityInteractionRange(threat, 0);
+        if (!inReach) {
+            Vec3 approach = threat.position().subtract(mc.player.position()).multiply(1, 0, 1).normalize();
+            Stand start = nearFoot(mc.player.blockPosition(), mc.player.getY());
+            Stand step = nearFoot(BlockPos.containing(mc.player.position().add(approach.scale(1.2))), mc.player.getY());
+            if (start != null && stepAllowed(start, step) && !start.floor.equals(step.floor)) {
+                float yaw = (float) Math.toDegrees(Math.atan2(-approach.x, approach.z));
+                if (Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - mc.player.getYRot())) < 25) mc.options.keyUp.setDown(true);
+                if (step.height > mc.player.getY() + .2) mc.options.keyJump.setDown(true);
+            }
+        }
+        if (inReach && mc.player.getAttackStrengthScale(0) >= .9f) {
+            Vec3 delta = threat.getEyePosition().subtract(mc.player.getEyePosition());
+            float yaw = (float) Math.toDegrees(Math.atan2(-delta.x, delta.z));
+            if (Math.abs(net.minecraft.util.Mth.wrapDegrees(yaw - mc.player.getYRot())) < 25) {
+                mc.gameMode.attack(mc.player, threat); mc.player.swing(InteractionHand.MAIN_HAND);
+            }
+        }
+        return true;
     }
     public String follow(String name) { ready(); stop(); following = name; return "STARTED: following " + name; }
     public String collect() {
@@ -247,8 +355,9 @@ public final class ClientMotor {
         if (!active) return;
         releaseKeys();
         if (mc.player == null || mc.level == null || !mc.player.isAlive()) { stop(); return; }
-        if (mc.gui.screen() != null) return;
+        if (ScreenPolicy.blocksWorld(mc.gui.screen())) return;
         if (mc.player.isInWater() && mc.player.getAirSupply() < 120) { mc.options.keyJump.setDown(true); mc.options.keyUp.setDown(false); return; }
+        if (defend()) return;
         if (eatingTicks > 0) {
             eatingTicks--; mc.options.keyUse.setDown(true);
             if (eatingTicks < 55 && !mc.player.isUsingItem()) { eatingTicks = 0; restoreFoodSlot(); result("Eating ended; current food level=" + mc.player.getFoodData().getFoodLevel()); }
@@ -372,6 +481,9 @@ public final class ClientMotor {
         for (Entity entity : mc.level.entitiesForRendering()) {
             if (entity == mc.player || mc.player.distanceTo(entity) > radius * 2 || !mc.player.hasLineOfSight(entity)) continue;
             JsonObject entry = new JsonObject(); entry.addProperty("name", entity.getName().getString()); entry.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
+            entry.addProperty("distance", Math.round(mc.player.distanceTo(entity) * 10) / 10.0);
+            entry.addProperty("hostile", entity instanceof Mob mob && hostile(mob));
+            if (entity instanceof LivingEntity living) entry.addProperty("health", living.getHealth());
             entry.addProperty("x", entity.getX()); entry.addProperty("y", entity.getY()); entry.addProperty("z", entity.getZ()); entities.add(entry); if (entities.size() >= 24) break;
         }
         state.add("visibleEntities", entities); return state;

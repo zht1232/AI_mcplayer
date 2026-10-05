@@ -134,6 +134,7 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                 check(score != null && score.value() == 1, "Dialog click did not execute the server action");
             });
             testPanelCancellation(context, server, connection);
+            testNoActionRecovery(context, server, connection);
             context.runOnClient(mc -> {
                 PartnerClient partner = PartnerClient.instance();
                 check(partner.command("enable", "") == 1, "entered multiplayer session should allow activation");
@@ -151,15 +152,22 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                 return new BlockPos(position.get("x").getAsInt(), position.get("y").getAsInt(), position.get("z").getAsInt());
             });
             context.runOnClient(mc -> check(PartnerClient.instance().moveManually(destination).startsWith("STARTED"), "short safe movement failed to plan"));
+            context.runOnClient(mc -> mc.gui.setScreen(new net.minecraft.client.gui.screens.PauseScreen(true)));
             context.waitFor(mc -> mc.player.position().distanceTo(new net.minecraft.world.phys.Vec3(destination.getX() + .5, destination.getY(), destination.getZ() + .5)) < .7, 180);
             context.waitTicks(25); connection.waitForServerboundPackets();
             server.runOnServer(mcServer -> check(connection.getServerPlayer().position().distanceTo(new net.minecraft.world.phys.Vec3(destination.getX() + .5, destination.getY(), destination.getZ() + .5)) < .9, "server did not accept normal movement"));
+            context.runOnClient(mc -> check(mc.gui.screen() instanceof net.minecraft.client.gui.screens.PauseScreen, "Esc overlay closed during movement"));
             BlockPos log = destination.offset(1, 0, 0);
             server.runOnServer(mcServer -> connection.getServerLevel().setBlockAndUpdate(log, net.minecraft.world.level.block.Blocks.OAK_LOG.defaultBlockState()));
             connection.waitForClientboundPackets();
             context.runOnClient(mc -> check(PartnerClient.instance().motor().dig(log).startsWith("STARTED"), "visible log mining did not start"));
             context.waitFor(mc -> !PartnerClient.instance().motor().busy(), 320);
             server.runOnServer(mcServer -> check(connection.getServerLevel().getBlockState(log).isAir(), "server did not confirm the mined block"));
+            context.runOnClient(mc -> {
+                check(mc.gui.screen() instanceof net.minecraft.client.gui.screens.PauseScreen, "Esc overlay closed during mining");
+                mc.gui.setScreen(null);
+            });
+            CombatReflexGameTest.run(context, server, connection);
             context.runOnClient(mc -> {
                 PartnerClient partner = PartnerClient.instance();
                 partner.command("disable", "");
@@ -188,6 +196,45 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
             context.takeScreenshot("mc-ai-partner-model-settings");
         }
         context.runOnClient(mc -> check(!PartnerClient.instance().enabled(), "disconnect did not stop AI"));
+    }
+
+    /** A plan-only model must neither spam public chat nor leave autonomous recovery idle. */
+    private void testNoActionRecovery(ClientGameTestContext context, TestDedicatedServerContext server, TestDedicatedServerConnection connection) {
+        String originalUrl = context.computeOnClient(mc -> PartnerClient.instance().config().baseUrl);
+        AtomicInteger requests = new AtomicInteger();
+        BlockPos resource = context.computeOnClient(mc -> mc.player.blockPosition().offset(6, 0, 0));
+        int initialLogs = context.computeOnClient(mc -> PartnerClient.instance().motor().inventoryCount("minecraft:oak_log"));
+        server.runOnServer(mcServer -> connection.getServerLevel().setBlockAndUpdate(resource, net.minecraft.world.level.block.Blocks.OAK_LOG.defaultBlockState()));
+        connection.waitForClientboundPackets();
+        try {
+            HttpServer model = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            model.createContext("/v1/chat/completions", exchange -> {
+                exchange.getRequestBody().readAllBytes();
+                String text = "REPEATED_WORK_PLAN_" + requests.incrementAndGet() + " 我看到周围有木头，先收集木材，然后检查食物。";
+                byte[] response = ("{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"" + text + "\"}}]}").getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, response.length); exchange.getResponseBody().write(response); exchange.close();
+            });
+            model.start();
+            try {
+                context.runOnClient(mc -> {
+                    var partner = PartnerClient.instance(); partner.command("disable", "");
+                    partner.config().baseUrl = "http://127.0.0.1:" + model.getAddress().getPort() + "/v1";
+                    check(partner.command("enable", "") == 1, "plan-only fixture activation failed");
+                    mc.gui.setScreen(new net.minecraft.client.gui.screens.PauseScreen(true));
+                });
+                context.waitFor(mc -> PartnerClient.instance().motor().inventoryCount("minecraft:oak_log") > initialLogs, 700);
+                connection.waitForServerboundPackets();
+                server.runOnServer(mcServer -> check(connection.getServerLevel().getBlockState(resource).isAir(), "plan-only recovery never mined the observed resource"));
+                context.runOnClient(mc -> {
+                    check(requests.get() >= 3, "fixture did not reproduce repeated narration");
+                    check(!PartnerClient.instance().uiBridge().snapshot().getAsJsonArray("chat").toString().contains("REPEATED_WORK_PLAN_"), "work narration leaked into public chat");
+                    check(mc.gui.screen() instanceof net.minecraft.client.gui.screens.PauseScreen, "recovery closed the user's Esc overlay");
+                });
+            } finally {
+                context.runOnClient(mc -> { PartnerClient.instance().command("disable", ""); PartnerClient.instance().config().baseUrl = originalUrl; mc.gui.setScreen(null); });
+                model.stop(0);
+            }
+        } catch (java.io.IOException error) { throw new RuntimeException(error); }
     }
 
     /** A delayed local mock lets cancel() exercise the real inline client callback. */
@@ -238,6 +285,8 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                     check(partner.lastError().isEmpty(), "opening F8 misreported intentional cancellation as model failure");
                     check(!partner.lastSpeech().contains("CancellationException"), "cancel exception was displayed to the player");
                 });
+                server.runOnServer(mcServer -> connection.getServerPlayer().sendSystemMessage(Component.literal("Guest: @" + connection.getServerPlayer().getGameProfile().name() + " 你好 __panel_reply__")));
+                connection.waitForClientboundPackets();
                 releaseFirst.countDown();
                 context.runOnClient(mc -> mc.gui.setScreen(null));
                 context.waitFor(mc -> requests.get() >= 2 && PartnerClient.instance().lastSpeech().equals("PANEL_REPLAN_OK"), 150);

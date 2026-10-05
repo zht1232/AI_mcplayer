@@ -67,6 +67,11 @@ public final class ModelObservation {
         int author = content.indexOf("对你说：");
         if (author >= 0) content = content.substring(author + 4).split("\\n", 2)[0];
         boolean menuOpen = rawUi.has("dialog") || (rawUi.has("container") && rawUi.getAsJsonObject("container").get("open").getAsBoolean());
+        if (rawUi.has("screen") && rawUi.get("screen").getAsString().equals("PauseScreen")) {
+            ui.remove("widgets"); ui.remove("title");
+            ui.addProperty("screen", "world");
+            ui.addProperty("localOverlay", "Esc menu is open; multiplayer world controls remain available.");
+        }
         boolean working = content.matches("(?is).*(自主|采|挖|走|移动|跟|过来|收集|种|建|造|放置|战斗|攻击|整理|存|取|拿|给|吃|交易|买|卖|传送|tp|钓|合成|熔|返回|打开|关闭|周围|环境|看见).*");
         boolean inventory = menuOpen || working || content.matches("(?is).*(背包|物品|装备|食物|材料|木头|资源).*") || requested.contains("inventory") || requested.contains("menu");
         boolean world = !menuOpen && (working || requested.contains("world"));

@@ -53,6 +53,11 @@ public final class AiBrain implements AutoCloseable {
             Only click inventory slots when container.open is true. Closed inventory data
             is observation only: use open_inventory first, or use_block to open a chest.
             Handle an open menu before attempting world movement.
+            A local multiplayer PauseScreen is an overlay: world actions may continue.
+            Work plans belong in tool calls, not repeated narration. If you see a resource,
+            use harvest_block to approach/mine/pick up instead of repeatedly describing it.
+            collect_nearby only collects an ItemEntity already on the ground; it never mines.
+            If a world action fails, do not repeat the same attempt unchanged.
             """;
 
     public record Options(String baseUrl, String model, String apiKeyEnv, int maxTokens, int timeoutSeconds,

@@ -28,6 +28,7 @@ public final class ToolCatalog {
         tools.add(tool("collect_nearby", "Walk to the nearest visible dropped item; verify actual pickup in inventory."));
         tools.add(tool("open_inventory", "Open own inventory to move existing items and craft using its 2x2 grid."));
         tools.add(tool("dig_block", "Mine an observed reachable block using equipped tool; wait for the actual block change.", "x:integer", "y:integer", "z:integer"));
+        tools.add(tool("harvest_block", "Approach an observed nearby resource safely, mine it with server confirmation, then collect drops. Prefer this single skill when the resource is beyond current reach. Only one block per call.", "x:integer", "y:integer", "z:integer"));
         tools.add(tool("place_block", "Place held block against an observed reachable supporting block face; face is up/down/north/south/east/west.", "x:integer", "y:integer", "z:integer", "face:string"));
         tools.add(tool("select_hotbar", "Select an existing hotbar item, index 0–8.", "slot:integer"));
         tools.add(tool("eat", "Eat food already in hotbar using normal client interaction."));
