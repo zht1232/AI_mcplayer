@@ -29,7 +29,9 @@ public final class RuntimeSkillBook {
         Path path = root.resolve(relative).normalize();
         if (!path.startsWith(root)) throw new IOException("Skill path escapes its root");
         Path parent = path.getParent();
-        if (Files.exists(parent) && !parent.toRealPath().startsWith(root)) throw new IOException("Skill folder points outside its root");
+        Path existing = parent;
+        while (existing != null && !Files.exists(existing)) existing = existing.getParent();
+        if (existing == null || !existing.toRealPath().startsWith(root)) throw new IOException("Skill folder points outside its root");
         if (Files.exists(path) && !path.toRealPath().startsWith(root)) throw new IOException("Skill file points outside its root");
         return path;
     }

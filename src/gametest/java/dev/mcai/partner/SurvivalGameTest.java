@@ -18,6 +18,17 @@ final class SurvivalGameTest {
     private static void check(boolean value, String message) { if (!value) throw new AssertionError(message); }
     static void run(ClientGameTestContext context, TestDedicatedServerContext server, TestDedicatedServerConnection connection) {
         context.runOnClient(mc -> PartnerClient.instance().command("disable", ""));
+        server.runOnServer(mcServer -> { connection.getServerPlayer().getInventory().setItem(15, new ItemStack(Items.OAK_LOG, 3)); connection.getServerPlayer().inventoryMenu.broadcastChanges(); });
+        connection.waitForClientboundPackets();
+        BasicCraftSkill craft = context.computeOnClient(BasicCraftSkill::new);
+        context.runOnClient(mc -> { check(craft.start("planks").startsWith("STARTED"), "basic crafting inputs not selected"); mc.gui.setScreen(new net.minecraft.client.gui.screens.ChatScreen("KEEP_CRAFT_DRAFT", false)); });
+        for (int tick = 0; tick < 160 && context.computeOnClient(mc -> craft.busy()); tick++) { context.waitTicks(1); context.runOnClient(mc -> craft.tick()); }
+        context.runOnClient(mc -> check(!craft.busy() && PartnerClient.instance().motor().inventoryCount("minecraft:oak_planks") >= 4, "basic planks recipe failed"));
+        context.runOnClient(mc -> check(craft.start("crafting_table").startsWith("STARTED"), "crafting-table inputs not selected"));
+        for (int tick = 0; tick < 160 && context.computeOnClient(mc -> craft.busy()); tick++) { context.waitTicks(1); context.runOnClient(mc -> craft.tick()); }
+        connection.waitForServerboundPackets();
+        server.runOnServer(mcServer -> check(connection.getServerPlayer().getInventory().contains(stack -> stack.is(Items.CRAFTING_TABLE)), "server never confirmed the basic crafting table"));
+        context.runOnClient(mc -> { check(mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen, "basic craft replaced the chat overlay"); mc.gui.setScreen(null); });
         BlockPos origin = context.computeOnClient(mc -> BlockPos.containing(mc.player.getX(), Math.floor(mc.player.getY() + .1), mc.player.getZ()));
         ArrayList<BlockPos> crops = new ArrayList<>(), immature = new ArrayList<>();
         for (int x = 2; x <= 9; x++) for (int z = -3; z <= 4; z++) {

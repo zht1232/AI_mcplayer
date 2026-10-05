@@ -33,6 +33,7 @@ public final class ToolCatalog {
         tools.add(tool("dig_block", "Mine an observed reachable block using equipped tool; wait for the actual block change.", "x:integer", "y:integer", "z:integer"));
         tools.add(tool("harvest_block", "Approach an observed nearby resource safely, mine it with server confirmation, then collect drops. Prefer this single skill when the resource is beyond current reach. Only one block per call.", "x:integer", "y:integer", "z:integer"));
         tools.add(tool("collect_resource", "Run continuous collection with a verified inventory quota. Supported nearby mature wheat/carrot/potato crops and observed log/block item ids; inventory stays closed. Prefer one call for a harvest task rather than one model decision per block.", "item:string", "count:integer"));
+        tools.add(tool("craft_basic", "Craft existing logs to planks, planks to sticks, or a crafting_table through normal 2x2 inventory clicks without opening a screen. recipe: planks/sticks/crafting_table. Wait for server inventory result.", "recipe:string"));
         tools.add(tool("place_block", "Place held block against an observed reachable supporting block face; face is up/down/north/south/east/west.", "x:integer", "y:integer", "z:integer", "face:string"));
         tools.add(tool("select_hotbar", "Select an existing hotbar item, index 0–8.", "slot:integer"));
         tools.add(tool("eat", "Eat existing safe food from inventory using normal client swaps and interaction; no inventory screen is needed."));

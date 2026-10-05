@@ -97,6 +97,17 @@ class AiBrainTest {
             assertEquals("inventory", result.actions().getFirst().args().get("target").getAsString());
         }
     }
+    @Test void conversationalRequestsOmitWorldAndMenuTools() throws Exception {
+        response = "{\"choices\":[{\"message\":{\"content\":\"你好\"},\"finish_reason\":\"stop\"}]}";
+        JsonObject observation = new JsonObject(); observation.addProperty("observationMode", "conversation");
+        try (AiBrain planner = new AiBrain(new AiBrain.Options(root, "test-model", "", 128, 5), dev.mcai.partner.ToolCatalog.schemas())) {
+            planner.request(observation, "你好", List.of()).get(5, TimeUnit.SECONDS);
+            assertTrue(request.getAsJsonArray("tools").toString().contains("chat_say"));
+            assertFalse(request.getAsJsonArray("tools").toString().contains("move_to"));
+            assertFalse(request.getAsJsonArray("tools").toString().contains("ui_click_slot"));
+            assertTrue(request.getAsJsonArray("tools").size() <= 5);
+        }
+    }
 
     @Test void normalizesRootExplicitBaseAndFullEndpointWithoutRetries() throws Exception {
         for (String base : List.of(root, root + "/v1", root + "/v1/chat/completions/")) {

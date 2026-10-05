@@ -45,6 +45,8 @@ final class NaturalSurvivalSoak {
                             var partner = PartnerClient.instance(); JsonObject data = new JsonObject();
                             data.addProperty("elapsedSeconds", elapsed / 1000); data.addProperty("x", mc.player.getX()); data.addProperty("y", mc.player.getY()); data.addProperty("z", mc.player.getZ());
                             data.addProperty("health", mc.player.getHealth()); data.addProperty("food", mc.player.getFoodData().getFoodLevel());
+                            data.addProperty("worldTicks", mc.level.getGameTime()); data.addProperty("dayTime", mc.level.getOverworldClockTime());
+                            data.add("nearby", partner.motor().snapshot(8));
                             data.addProperty("status", partner.status()); data.addProperty("modelMetrics", partner.plannerSummary()); data.addProperty("lastError", partner.lastError());
                             JsonObject items = new JsonObject();
                             for (String item : java.util.List.of("oak_log", "birch_log", "spruce_log", "wheat", "bread", "apple", "cooked_beef", "beef", "crafting_table", "wooden_pickaxe", "stone_pickaxe")) items.addProperty(item, partner.motor().inventoryCount("minecraft:" + item));

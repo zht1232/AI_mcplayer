@@ -47,10 +47,13 @@ public final class PartnerClient implements ClientModInitializer {
     private final SpeechPolicy speechPolicy = new SpeechPolicy();
     private final InventoryOpenPolicy inventoryPolicy = new InventoryOpenPolicy();
     private HarvestSkill harvest;
+    private BasicCraftSkill basicCraft;
+    private long nextBasicCraft;
     private long workProgress;
     private int narrationOnlyDecisions;
     private long lastDecisionProgress = -1;
     private long nextFallback;
+    private final ArrayDeque<BlockPos> recentExploration = new ArrayDeque<>();
     private RuntimeSkillBook skillBook;
     private long collectionGeneration = -1;
     private long nextHelpRequest;
@@ -90,12 +93,13 @@ public final class PartnerClient implements ClientModInitializer {
         instance = this;
         try { config = PartnerConfig.load(); } catch (Exception e) { LOG.error("Invalid config; AI will require correction", e); configurationReady = false; config = new PartnerConfig(); lastError = "配置读取失败：" + e.getMessage(); }
         ui = new UiBridge(mc); motor = new ClientMotor(mc, config.navigationRange); harvest = new HarvestSkill(mc, motor);
+        basicCraft = new BasicCraftSkill(mc);
         try { skillBook = new RuntimeSkillBook(FabricLoader.getInstance().getConfigDir().resolve("wildling/skills")); }
         catch (java.io.IOException e) { LOG.warn("Could not initialize skill knowledge: {}", e.getClass().getSimpleName()); }
         KeyMapping.Category category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath("mc_ai_partner", "controls"));
         panelKey = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.mc_ai_partner.panel", GLFW.GLFW_KEY_F8, category));
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
-            control.connect(); ui.clear(); feedback.clear(); actions.clear(); recentSpeech.clear(); dialogue.clear(); speechPolicy.clear(); workProgress = 0;
+            control.connect(); ui.clear(); feedback.clear(); actions.clear(); recentSpeech.clear(); recentExploration.clear(); dialogue.clear(); speechPolicy.clear(); workProgress = 0;
             notice("已连接。F8 打开面板；/aip enable 开启当前账号的 AI。");
         });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> { control.disconnect(); invalidate(); motor.active(false); ui.clear(); });
@@ -247,6 +251,7 @@ public final class PartnerClient implements ClientModInitializer {
         // Invalidate their captured revision before cancelling the old future.
         memoryRevision++;
         if (harvest != null) harvest.stop();
+        if (basicCraft != null) basicCraft.cancel();
         narrationOnlyDecisions = 0;
         lastDecisionProgress = -1;
         CompletableFuture<AiBrain.Decision> obsolete = pending;
@@ -356,6 +361,10 @@ public final class PartnerClient implements ClientModInitializer {
             nextHelpRequest = ticks + 1200; helpUrgency = 3;
             say("我血量很低，还缺食物，附近有人能帮我脱离战斗、给点补给吗？");
         }
+        basicCraft.tick();
+        String crafted = basicCraft.drainResult();
+        if (crafted != null) { rememberResult("craft_basic: " + crafted); if (crafted.startsWith("OK")) workProgress++; }
+        if (basicCraft.busy()) return;
         if (targetItem != null && motor.inventoryCount(targetItem) >= targetCount) {
             if (targetStableTicks == 0) { invalidateRequest(); if (!motor.survivalBusy()) motor.stop(); }
             if (++targetStableTicks >= 20) {
@@ -376,6 +385,20 @@ public final class PartnerClient implements ClientModInitializer {
             return; // A deterministic local movement does not need an LLM request.
         }
         configureQuantityTask();
+        if (control.autonomous() && !control.localControl() && !control.publicGoal() && targetItem == null && !motor.busy() && !harvest.busy()
+                && pending == null && ticks >= nextBasicCraft && mc.player.getHealth() > 12 && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
+            int logs = 0, planks = 0;
+            for (int slot = 0; slot < 36; slot++) {
+                var stack = mc.player.getInventory().getItem(slot); String id = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+                if (id.endsWith("_log")) logs += stack.getCount(); if (id.endsWith("_planks")) planks += stack.getCount();
+            }
+            String recipe = planks >= 4 && motor.inventoryCount("minecraft:crafting_table") == 0 ? "crafting_table"
+                    : planks >= 2 && motor.inventoryCount("minecraft:stick") < 4 ? "sticks" : logs > 0 && planks < 8 ? "planks" : "";
+            if (!recipe.isEmpty()) {
+                nextBasicCraft = ticks + 200; String craft = basicCraft.start(recipe);
+                rememberResult("Autonomous craft_basic: " + craft); if (craft.startsWith("STARTED")) return;
+            }
+        }
         if (targetItem != null && !motor.busy() && pending == null && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
             JsonObject current = new JsonObject(); current.add("selfAndWorld", motor.snapshot(config.scanRadius));
             if (startFallback(current)) return;
@@ -503,6 +526,18 @@ public final class PartnerClient implements ClientModInitializer {
                 notice("正在执行采集流程：接近资源、挖掘、拾取，再核对背包。");
                 return true;
             }
+            rememberResult("Recovery target " + pos + ": " + result);
+        }
+        if (candidates.isEmpty() && targetItem == null && !control.localControl() && !control.publicGoal()) {
+            JsonArray destinations = observation.getAsJsonObject("selfAndWorld").getAsJsonArray("safeDestinations");
+            if (destinations != null) for (var value : destinations) {
+                BlockPos next = position(value.getAsJsonObject()); if (recentExploration.contains(next)) continue;
+                String moved = motor.moveTo(next);
+                if (moved.startsWith("STARTED")) {
+                    recentExploration.addLast(next); while (recentExploration.size() > 32) recentExploration.removeFirst();
+                    actions.clear(); narrationOnlyDecisions = 0; rememberResult("RECOVERY exploration: " + moved); return true;
+                }
+            }
         }
         return false;
     }
@@ -546,6 +581,7 @@ public final class PartnerClient implements ClientModInitializer {
                 targetItem = item; targetStartCount = motor.inventoryCount(item); targetCount = targetStartCount + count; targetStableTicks = 0; nextFallback = ticks;
                 yield "STARTED: continuous collection of " + count + " new " + item + "; verify stable inventory quota";
             }
+            case "craft_basic" -> motor.busy() || harvest.busy() ? "FAILED: finish the physical task first" : basicCraft.start(args.get("recipe").getAsString());
             case "place_block" -> motor.place(position(args), args.get("face").getAsString());
             case "select_hotbar" -> motor.select(args.get("slot").getAsInt());
             case "eat" -> motor.eat();
