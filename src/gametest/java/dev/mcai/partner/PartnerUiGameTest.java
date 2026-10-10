@@ -170,6 +170,8 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
             });
             CombatReflexGameTest.run(context, server, connection);
             SurvivalGameTest.run(context, server, connection);
+            WorkbenchSkillGameTest.run(context, server, connection);
+            ForageSkillGameTest.run(context, server, connection);
             context.runOnClient(mc -> {
                 PartnerClient partner = PartnerClient.instance();
                 partner.command("disable", "");
@@ -219,6 +221,8 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
     private void testNoActionRecovery(ClientGameTestContext context, TestDedicatedServerContext server, TestDedicatedServerConnection connection) {
         String originalUrl = context.computeOnClient(mc -> PartnerClient.instance().config().baseUrl);
         AtomicInteger requests = new AtomicInteger();
+        server.runOnServer(mcServer -> { connection.getServerPlayer().getInventory().clearContent(); connection.getServerPlayer().inventoryMenu.broadcastChanges(); });
+        connection.waitForClientboundPackets();
         BlockPos resource = context.computeOnClient(mc -> mc.player.blockPosition().offset(6, 0, 0));
         int initialLogs = context.computeOnClient(mc -> PartnerClient.instance().motor().inventoryCount("minecraft:oak_log"));
         server.runOnServer(mcServer -> connection.getServerLevel().setBlockAndUpdate(resource, net.minecraft.world.level.block.Blocks.OAK_LOG.defaultBlockState()));
@@ -239,11 +243,13 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                     check(partner.command("enable", "") == 1, "plan-only fixture activation failed");
                     mc.gui.setScreen(new net.minecraft.client.gui.screens.PauseScreen(true));
                 });
-                context.waitFor(mc -> PartnerClient.instance().motor().inventoryCount("minecraft:oak_log") > initialLogs, 700);
+                context.waitFor(mc -> mc.level.getBlockState(resource).isAir()
+                        && (PartnerClient.instance().motor().inventoryCount("minecraft:oak_log") > initialLogs
+                        || PartnerClient.instance().motor().inventoryCount("minecraft:oak_planks") > 0), 700);
                 connection.waitForServerboundPackets();
                 server.runOnServer(mcServer -> check(connection.getServerLevel().getBlockState(resource).isAir(), "plan-only recovery never mined the observed resource"));
                 context.runOnClient(mc -> {
-                    check(requests.get() >= 3, "fixture did not reproduce repeated narration");
+                    check(requests.get() <= 1, "basic autonomous work waited for repeated model decisions");
                     check(!PartnerClient.instance().uiBridge().snapshot().getAsJsonArray("chat").toString().contains("REPEATED_WORK_PLAN_"), "work narration leaked into public chat");
                     check(mc.gui.screen() instanceof net.minecraft.client.gui.screens.PauseScreen, "recovery closed the user's Esc overlay");
                 });
@@ -294,6 +300,8 @@ public final class PartnerUiGameTest implements FabricClientGameTest {
                     partner.config().baseUrl = mockUrl;
                     partner.config().model = "cancellation-test";
                     check(partner.command("enable", "") == 1, "mock brain activation failed");
+                    partner.command("auto", "off");
+                    partner.takeLocalControl("你好 __panel_reply__");
                 });
                 context.waitFor(mc -> firstStarted.getCount() == 0, 150);
                 context.runOnClient(mc -> {

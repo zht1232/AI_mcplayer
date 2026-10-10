@@ -48,6 +48,9 @@ public final class PartnerClient implements ClientModInitializer {
     private final InventoryOpenPolicy inventoryPolicy = new InventoryOpenPolicy();
     private HarvestSkill harvest;
     private BasicCraftSkill basicCraft;
+    private WorkbenchSkill workbench;
+    private ForageSkill forage;
+    private long nextForage;
     private long nextBasicCraft;
     private long workProgress;
     private int narrationOnlyDecisions;
@@ -94,6 +97,7 @@ public final class PartnerClient implements ClientModInitializer {
         try { config = PartnerConfig.load(); } catch (Exception e) { LOG.error("Invalid config; AI will require correction", e); configurationReady = false; config = new PartnerConfig(); lastError = "配置读取失败：" + e.getMessage(); }
         ui = new UiBridge(mc); motor = new ClientMotor(mc, config.navigationRange); harvest = new HarvestSkill(mc, motor);
         basicCraft = new BasicCraftSkill(mc);
+        workbench = new WorkbenchSkill(mc, motor); forage = new ForageSkill(mc, motor);
         try { skillBook = new RuntimeSkillBook(FabricLoader.getInstance().getConfigDir().resolve("wildling/skills")); }
         catch (java.io.IOException e) { LOG.warn("Could not initialize skill knowledge: {}", e.getClass().getSimpleName()); }
         KeyMapping.Category category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath("mc_ai_partner", "controls"));
@@ -181,8 +185,11 @@ public final class PartnerClient implements ClientModInitializer {
     public boolean enabled() { return control.enabled(); }
     public boolean publicTaskActive() { return control.publicGoal(); }
     public boolean collectionActive() { return targetItem != null; }
+    public boolean executionActive() { return motor.busy() || harvest.busy() || basicCraft.busy() || workbench.busy() || forage.busy(); }
     public String status() {
-        String activity = pending == null ? motor.status() : "等待模型 " + (System.nanoTime() - requestStartedNanos) / 1_000_000_000L + " 秒";
+        String activity = motor.survivalBusy() ? motor.status() : workbench.busy() ? "工作台合成"
+                : basicCraft.busy() ? "基础合成" : forage.busy() ? "觅食" : harvest.busy() ? "采集"
+                : pending == null ? motor.status() : "等待模型 " + (System.nanoTime() - requestStartedNanos) / 1_000_000_000L + " 秒";
         activity = activity.replace("idle", "待命").replace("walking", "行走").replace("digging", "采掘").replace("eating", "进食").replace("following", "跟随");
         return (control.enabled() ? "运行" : "暂停") + " / " + activity + " / " + (control.localControl() ? "本地优先" : "自主/对话") + " / 排队 " + control.queued();
     }
@@ -252,6 +259,8 @@ public final class PartnerClient implements ClientModInitializer {
         memoryRevision++;
         if (harvest != null) harvest.stop();
         if (basicCraft != null) basicCraft.cancel();
+        if (workbench != null) workbench.cancel();
+        if (forage != null) forage.cancel();
         narrationOnlyDecisions = 0;
         lastDecisionProgress = -1;
         CompletableFuture<AiBrain.Decision> obsolete = pending;
@@ -263,6 +272,12 @@ public final class PartnerClient implements ClientModInitializer {
         if (obsolete != null) obsolete.cancel(true);
     }
     private void invalidate() { invalidateRequest(); if (brain != null) brain.close(); brain = null; }
+    private void cancelPlannerKeepExecution() {
+        if (pending == null) return;
+        memoryRevision++; var obsolete = pending; pending = null; obsolete.cancel(true);
+        nextDecision = ticks + config.decisionIntervalSeconds * 20L;
+        rememberResult("Planner interrupted: deterministic autonomous work already started; re-observe its real result before another decision.");
+    }
     private String serverKey() { return mc.getCurrentServer() == null ? "" : mc.getCurrentServer().ip; }
     private void dialogue(String role, String speaker, String text) {
         JsonObject turn = new JsonObject(); turn.addProperty("role", role); turn.addProperty("speaker", speaker); turn.addProperty("text", text.substring(0, Math.min(240, text.length())));
@@ -363,8 +378,23 @@ public final class PartnerClient implements ClientModInitializer {
         }
         basicCraft.tick();
         String crafted = basicCraft.drainResult();
-        if (crafted != null) { rememberResult("craft_basic: " + crafted); if (crafted.startsWith("OK")) workProgress++; }
+        if (crafted != null) { rememberResult("craft_basic: " + crafted); if (crafted.startsWith("OK")) { workProgress++; nextBasicCraft = ticks; } }
         if (basicCraft.busy()) return;
+        if (workbench.busy() && mc.player.getHealth() <= 12) invalidateRequest();
+        workbench.tick();
+        String tooled = workbench.drainResult();
+        if (tooled != null) { rememberResult("craft_workbench: " + tooled); if (tooled.startsWith("OK")) { workProgress++; nextBasicCraft = ticks; } }
+        if (workbench.busy()) return;
+        forage.tick();
+        String foraged = forage.drainResult();
+        if (foraged != null) { rememberResult("forage_food: " + foraged); if (foraged.startsWith("OK")) workProgress++; }
+        if (forage.busy()) return;
+        if (control.autonomous() && !control.localControl() && !control.publicGoal() && pending != null
+                && System.nanoTime() - requestStartedNanos > 5_000_000_000L && !motor.busy() && !harvest.busy()
+                && ticks >= nextFallback && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
+            JsonObject current = new JsonObject(); current.add("selfAndWorld", motor.snapshot(config.scanRadius));
+            if (startFallback(current)) { cancelPlannerKeepExecution(); return; }
+        }
         if (targetItem != null && motor.inventoryCount(targetItem) >= targetCount) {
             if (targetStableTicks == 0) { invalidateRequest(); if (!motor.survivalBusy()) motor.stop(); }
             if (++targetStableTicks >= 20) {
@@ -385,6 +415,11 @@ public final class PartnerClient implements ClientModInitializer {
             return; // A deterministic local movement does not need an LLM request.
         }
         configureQuantityTask();
+        if (control.autonomous() && !control.localControl() && !control.publicGoal() && targetItem == null && !motor.busy()
+                && !harvest.busy() && pending == null && ticks >= nextForage && !motor.hasFood() && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
+            nextForage = ticks + 200; String food = forage.start();
+            if (food.startsWith("STARTED")) { actions.clear(); rememberResult("Autonomous forage_food: " + food); return; }
+        }
         if (control.autonomous() && !control.localControl() && !control.publicGoal() && targetItem == null && !motor.busy() && !harvest.busy()
                 && pending == null && ticks >= nextBasicCraft && mc.player.getHealth() > 12 && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
             int logs = 0, planks = 0;
@@ -392,16 +427,25 @@ public final class PartnerClient implements ClientModInitializer {
                 var stack = mc.player.getInventory().getItem(slot); String id = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
                 if (id.endsWith("_log")) logs += stack.getCount(); if (id.endsWith("_planks")) planks += stack.getCount();
             }
-            String recipe = planks >= 4 && motor.inventoryCount("minecraft:crafting_table") == 0 ? "crafting_table"
+            String recipe = planks >= 4 && motor.inventoryCount("minecraft:crafting_table") == 0 && !workbench.hasReachableTable() ? "crafting_table"
                     : planks >= 2 && motor.inventoryCount("minecraft:stick") < 4 ? "sticks" : logs > 0 && planks < 8 ? "planks" : "";
             if (!recipe.isEmpty()) {
                 nextBasicCraft = ticks + 200; String craft = basicCraft.start(recipe);
-                rememberResult("Autonomous craft_basic: " + craft); if (craft.startsWith("STARTED")) return;
+                rememberResult("Autonomous craft_basic: " + craft); if (craft.startsWith("STARTED")) { actions.clear(); return; }
+            } else if (planks >= 3 && motor.inventoryCount("minecraft:stick") >= 2) {
+                String tool = motor.inventoryCount("minecraft:wooden_axe") == 0 ? "wooden_axe"
+                        : motor.inventoryCount("minecraft:wooden_pickaxe") == 0 ? "wooden_pickaxe" : "";
+                if (!tool.isEmpty()) { nextBasicCraft = ticks + 200; String craft = workbench.start(tool); rememberResult("Autonomous craft_workbench: " + craft); if (craft.startsWith("STARTED")) { actions.clear(); return; } }
             }
         }
         if (targetItem != null && !motor.busy() && pending == null && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
             JsonObject current = new JsonObject(); current.add("selfAndWorld", motor.snapshot(config.scanRadius));
             if (startFallback(current)) return;
+        }
+        if (control.autonomous() && !control.localControl() && !control.publicGoal() && pending == null
+                && !motor.busy() && !harvest.busy() && ticks >= nextFallback && !ScreenPolicy.blocksWorld(mc.gui.screen())) {
+            JsonObject current = new JsonObject(); current.add("selfAndWorld", motor.snapshot(config.scanRadius));
+            if (startFallback(current)) return; // Basic work does not wait for a narration/LLM failure first.
         }
         if (!motor.busy() && !actions.isEmpty()) {
             if (actionGeneration != control.generation()) { actions.clear(); return; }
@@ -528,7 +572,7 @@ public final class PartnerClient implements ClientModInitializer {
             }
             rememberResult("Recovery target " + pos + ": " + result);
         }
-        if (candidates.isEmpty() && targetItem == null && !control.localControl() && !control.publicGoal()) {
+        if (targetItem == null && !control.localControl() && !control.publicGoal()) {
             JsonArray destinations = observation.getAsJsonObject("selfAndWorld").getAsJsonArray("safeDestinations");
             if (destinations != null) for (var value : destinations) {
                 BlockPos next = position(value.getAsJsonObject()); if (recentExploration.contains(next)) continue;
@@ -582,6 +626,8 @@ public final class PartnerClient implements ClientModInitializer {
                 yield "STARTED: continuous collection of " + count + " new " + item + "; verify stable inventory quota";
             }
             case "craft_basic" -> motor.busy() || harvest.busy() ? "FAILED: finish the physical task first" : basicCraft.start(args.get("recipe").getAsString());
+            case "craft_workbench" -> motor.busy() || harvest.busy() || basicCraft.busy() || forage.busy() ? "FAILED: finish the active skill first" : workbench.start(args.get("recipe").getAsString());
+            case "forage_food" -> motor.busy() || harvest.busy() || basicCraft.busy() || workbench.busy() ? "FAILED: finish the active skill first" : forage.start();
             case "place_block" -> motor.place(position(args), args.get("face").getAsString());
             case "select_hotbar" -> motor.select(args.get("slot").getAsInt());
             case "eat" -> motor.eat();
@@ -646,7 +692,7 @@ public final class PartnerClient implements ClientModInitializer {
                     requireConnected(); Path file = FabricLoader.getInstance().getConfigDir().resolve("mc-ai-partner-observation.json");
                     Files.writeString(file, new GsonBuilder().setPrettyPrinting().create().toJson(observation()), StandardCharsets.UTF_8); notice("观察数据已写入 " + file);
                 }
-                case "reload" -> { boolean wasEnabled = control.enabled(); disable(); configurationReady = false; config = PartnerConfig.load(); configurationReady = true; motor = new ClientMotor(mc, config.navigationRange); harvest = new HarvestSkill(mc, motor); if (wasEnabled) enable(); notice("配置已重载。"); }
+                case "reload" -> { boolean wasEnabled = control.enabled(); disable(); configurationReady = false; config = PartnerConfig.load(); configurationReady = true; motor = new ClientMotor(mc, config.navigationRange); harvest = new HarvestSkill(mc, motor); basicCraft = new BasicCraftSkill(mc); workbench = new WorkbenchSkill(mc, motor); forage = new ForageSkill(mc, motor); if (wasEnabled) enable(); notice("配置已重载。"); }
                 case "thinking", "reasoningprotocol" -> {
                     if (command.equals("thinking") && !value.equals("on") && !value.equals("off"))
                         throw new IllegalArgumentException("推理开关使用 on 或 off");

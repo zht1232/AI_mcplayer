@@ -63,6 +63,7 @@ public final class ClientMotor {
     private BlockPos escapeExit;
     private boolean escaping;
     private int survivalTicks, escapeCooldown, foodRetry;
+    private int combatSupplyRetry;
     private boolean defending;
     private boolean retreating;
     private int defenceQuietTicks;
@@ -151,6 +152,14 @@ public final class ClientMotor {
         stop(); destination = end.center(); route.addAll(found); lastPosition = mc.player.position();
         return route.isEmpty() ? "OK: already at target" : "STARTED: walking; await arrival result";
     }
+    public boolean canMineFrom(BlockPos standing, BlockPos target) {
+        Stand candidate = nearFoot(standing, standing.getY()); if (candidate == null) return false;
+        Vec3 eye = candidate.center().add(0, mc.player.getEyeHeight(), 0);
+        if (eye.distanceTo(Vec3.atCenterOf(target)) > mc.player.blockInteractionRange() - .1) return false;
+        BlockHitResult hit = mc.level.clip(new ClipContext(eye, Vec3.atCenterOf(target), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
+        return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(target);
+    }
+    public boolean canMineNow(BlockPos target) { return mc.player != null && mc.level != null && visibleHit(target) != null; }
     private double heuristic(Stand a, Stand b) {
         return Math.abs(a.floor.getX() - b.floor.getX()) + Math.abs(a.floor.getZ() - b.floor.getZ()) + Math.abs(a.height - b.height);
     }
@@ -228,7 +237,7 @@ public final class ClientMotor {
         if (side == null) return "FAILED: invalid block face";
         BlockHitResult seen = visibleHit(support);
         if (seen == null) return "FAILED: supporting block not visible or out of reach";
-        Vec3 hitPoint = Vec3.atCenterOf(support).add(side.getStepX() * .501, side.getStepY() * .501, side.getStepZ() * .501);
+        Vec3 hitPoint = Vec3.atCenterOf(support).add(side.getStepX() * .499, side.getStepY() * .499, side.getStepZ() * .499);
         BlockHitResult direct = mc.level.clip(new ClipContext(mc.player.getEyePosition(), hitPoint, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
         if (!direct.getBlockPos().equals(support) || direct.getDirection() != side) return "FAILED: selected supporting face is not visible";
         look(hitPoint); mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, direct); mc.player.swing(InteractionHand.MAIN_HAND);
@@ -340,6 +349,7 @@ public final class ClientMotor {
     }
     /** Runs before planning and physical work, so a pending HTTP request cannot delay self-defence. */
     private boolean defend() {
+        if (combatSupplyRetry > 0) combatSupplyRetry--;
         if (escaping) return false; // Clearing an exit is part of the same emergency, not a competing fight.
         float health = mc.player.getHealth();
         if (!Float.isNaN(lastHealth) && health < lastHealth) recentDamageTicks = 60;
@@ -367,7 +377,15 @@ public final class ClientMotor {
             if (interrupted) result("FAILED: physical work interrupted for immediate self-defence; re-plan when safe");
         }
         defenceQuietTicks = 0;
-        retreating = health <= 6 || threat instanceof Creeper;
+        if (health <= 10 && nearest >= 2.5 && !(threat instanceof Creeper) && eatingTicks == 0 && combatSupplyRetry == 0) {
+            // Using supplies is part of defence, so an ongoing fight cannot starve the eating state.
+            defending = false;
+            String supplies = useHealingItem();
+            if (!supplies.startsWith("STARTED") && mc.player.getFoodData().needsFood() && hasFood()) supplies = eat();
+            defending = true; combatSupplyRetry = 80;
+            if (supplies.startsWith("STARTED")) result("SURVIVAL INTERRUPT: using existing supplies while keeping distance from the threat");
+        }
+        retreating = health <= 6 || eatingTicks > 0 || threat instanceof Creeper;
         if (retreating) {
             // Retreat only over a neighbouring dry, collision-free standing cell. Never back into an unseen drop.
             Vec3 away = mc.player.position().subtract(threat.position()).multiply(1, 0, 1);
@@ -375,6 +393,16 @@ public final class ClientMotor {
             Vec3 direction = away.normalize();
             Stand start = nearFoot(mc.player.blockPosition(), mc.player.getY());
             Stand escape = nearFoot(BlockPos.containing(mc.player.position().add(direction.scale(1.2))), mc.player.getY());
+            if (start != null && (!stepAllowed(start, escape) || start.floor.equals(escape.floor))) {
+                Stand alternate = null; double safest = nearest * nearest;
+                for (Direction side : Direction.Plane.HORIZONTAL) {
+                    Stand candidate = nearFoot(mc.player.blockPosition().relative(side), mc.player.getY());
+                    if (!stepAllowed(start, candidate) || start.floor.equals(candidate.floor)) continue;
+                    double separation = candidate.center().distanceToSqr(threat.position());
+                    if (separation > safest) { safest = separation; alternate = candidate; }
+                }
+                if (alternate != null) { escape = alternate; direction = escape.center().subtract(mc.player.position()).multiply(1,0,1).normalize(); }
+            }
             if (start != null && stepAllowed(start, escape) && !start.floor.equals(escape.floor)) {
                 look(escape.center().add(0, mc.player.getEyeHeight(), 0));
                 float yaw = (float) Math.toDegrees(Math.atan2(-direction.x, direction.z));
@@ -387,6 +415,15 @@ public final class ClientMotor {
                 if (opened.startsWith("STARTED")) return false;
                 defending = true;
                 result("NEED_HELP: threatened and trapped without a safe breakable exit");
+            }
+            if (eatingTicks == 0 && !(threat instanceof Creeper) && mc.player.isWithinEntityInteractionRange(threat, 0)
+                    && mc.player.getAttackStrengthScale(0) >= .9f) {
+                // Retreating can be obstructed; still fend off a reachable attacker with normal cooldown.
+                if (!mc.options.keyUp.isDown()) look(threat.getEyePosition());
+                Vec3 aim = threat.getEyePosition().subtract(mc.player.getEyePosition());
+                if (Math.abs(net.minecraft.util.Mth.wrapDegrees((float)Math.toDegrees(Math.atan2(-aim.x, aim.z))-mc.player.getYRot())) < 25) {
+                    mc.gameMode.attack(mc.player, threat); mc.player.swing(InteractionHand.MAIN_HAND);
+                }
             }
             return true;
         }
@@ -488,7 +525,8 @@ public final class ClientMotor {
                 return true;
             }
             BlockPos exit = escapeExit;
-            if (mc.player.position().distanceTo(Vec3.atBottomCenterOf(exit)) < .8) {
+            Stand exited = nearFoot(exit, mc.player.getY());
+            if (exited != null && mc.player.position().distanceTo(exited.center()) < .8) {
                 escaping = false; escapeExit = null; escapeCooldown = 200; result("OK: escaped through a server-confirmed opening"); return true;
             }
             escaping = false; String moved = moveTo(exit);
@@ -502,18 +540,21 @@ public final class ClientMotor {
         }
         return false;
     }
+    private void tickConsumption() {
+        eatingTicks--; mc.options.keyUse.setDown(true);
+        if (eatingTicks < 55 && !mc.player.isUsingItem()) { eatingTicks = 0; restoreFoodSlot(); result("Eating ended; current food level=" + mc.player.getFoodData().getFoodLevel()); }
+        else if (eatingTicks == 0) { mc.gameMode.releaseUsingItem(mc.player); restoreFoodSlot(); result("Eating timed out; inspect food level"); }
+    }
     public void tick() {
         if (!active) return;
         releaseKeys();
         if (mc.player == null || mc.level == null || !mc.player.isAlive()) { stop(); return; }
         if (ScreenPolicy.blocksWorld(mc.gui.screen())) return;
         if (mc.player.isInWater() && mc.player.getAirSupply() < 120) { mc.options.keyJump.setDown(true); mc.options.keyUp.setDown(false); return; }
-        if (defend()) return;
+        if (defend()) { if (eatingTicks > 0) tickConsumption(); return; }
         if (survival()) return;
         if (eatingTicks > 0) {
-            eatingTicks--; mc.options.keyUse.setDown(true);
-            if (eatingTicks < 55 && !mc.player.isUsingItem()) { eatingTicks = 0; restoreFoodSlot(); result("Eating ended; current food level=" + mc.player.getFoodData().getFoodLevel()); }
-            else if (eatingTicks == 0) { mc.gameMode.releaseUsingItem(mc.player); restoreFoodSlot(); result("Eating timed out; inspect food level"); }
+            tickConsumption();
             return;
         }
         if (digging != null) {

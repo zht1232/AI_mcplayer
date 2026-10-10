@@ -66,10 +66,10 @@ public final class BasicCraftSkill {
     private void cleanup() {
         if (mc.player == null || mc.gameMode == null || mc.player.containerMenu != mc.player.inventoryMenu) return;
         var menu = mc.player.inventoryMenu;
-        if (!menu.getCarried().isEmpty()) for (int slot = 9; slot < 45; slot++) {
+        if (!menu.getCarried().isEmpty()) for (int slot = 9; slot < 45 && !menu.getCarried().isEmpty(); slot++) {
             var item = menu.getSlot(slot).getItem();
             if (item.isEmpty() || net.minecraft.world.item.ItemStack.isSameItemSameComponents(item, menu.getCarried()) && item.getCount() < item.getMaxStackSize()) {
-                mc.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.PICKUP, mc.player); break;
+                mc.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.PICKUP, mc.player);
             }
         }
         if (menu.getCarried().isEmpty()) for (int slot = 1; slot <= 4; slot++) if (!menu.getSlot(slot).getItem().isEmpty())

@@ -34,7 +34,7 @@ public final class HarvestSkill {
         String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(block).getBlock()).toString();
         dropItem = blockId.equals("minecraft:carrots") ? "minecraft:carrot" : blockId.equals("minecraft:potatoes") ? "minecraft:potato" : blockId;
         initialCount = motor.inventoryCount(dropItem);
-        if (reachable(block)) {
+        if (motor.canMineNow(block)) {
             String digging = motor.dig(block);
             if (digging.startsWith("STARTED")) { target = block.immutable(); phase = Phase.MINE; }
             return digging;
@@ -44,15 +44,21 @@ public final class HarvestSkill {
             for (int dy = -4; dy <= 1; dy++) candidates.add(block.relative(direction).offset(0, dy, 0));
             candidates.add(new BlockPos(block.getX() + direction.getStepX(), mc.player.blockPosition().getY(), block.getZ() + direction.getStepZ()));
         }
+        for (int dx = -3; dx <= 3; dx++) for (int dz = -3; dz <= 3; dz++) {
+            if (Math.max(Math.abs(dx), Math.abs(dz)) < 2) continue;
+            candidates.add(new BlockPos(block.getX() + dx, mc.player.blockPosition().getY(), block.getZ() + dz));
+            candidates.add(new BlockPos(block.getX() + dx, block.getY(), block.getZ() + dz));
+        }
         candidates.sort(Comparator.comparingDouble(pos -> mc.player.distanceToSqr(Vec3.atCenterOf(pos))));
+        int pathsTried = 0;
         for (BlockPos nearby : candidates) {
+            if (!motor.canMineFrom(nearby, block)) continue;
+            if (++pathsTried > 8) break;
             String walking = motor.moveTo(nearby);
             if (walking.startsWith("STARTED")) { target = block.immutable(); phase = Phase.APPROACH; return "STARTED: approaching observed block, then mining and collecting"; }
         }
-        return "FAILED: no safe adjacent path to the observed block";
-    }
-    private boolean reachable(BlockPos block) {
-        return mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(block)) <= mc.player.blockInteractionRange();
+        retryAfter.put(block.immutable(), System.currentTimeMillis() + 60_000);
+        return "FAILED: no safe mining position for the observed block; try another visible resource";
     }
     public void feedback(String result) {
         if (!busy()) return;
@@ -82,7 +88,9 @@ public final class HarvestSkill {
                 if (pickup.startsWith("STARTED")) phase = Phase.PICKUP;
                 else if (dropWait >= 60) finish("MINED: server confirmed the block change but no drop/pickup arrived; read passive inventory counts");
             }
-            case PICKUP -> finish("OK: harvest sequence ended; read passive inventory counts, no screen opening is needed");
+            case PICKUP -> finish(motor.inventoryCount(dropItem) > initialCount
+                    ? "OK: harvest target inventory increased; no inventory screen was opened"
+                    : "MINED: server block changed but target inventory did not increase; inspect passive counts and remaining drops");
         }
     }
     private void finish(String result) {

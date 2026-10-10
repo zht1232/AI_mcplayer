@@ -261,7 +261,7 @@ public final class AiBrain implements AutoCloseable {
             String mode = observation.has("observationMode") ? observation.get("observationMode").getAsString() : "full";
             Set<String> selected = switch (mode) {
                 case "conversation" -> Set.of("chat_say", "complete_goal", "remember", "learn_skill", "observe");
-                case "world" -> Set.of("move_to", "harvest_block", "collect_resource", "collect_nearby", "craft_basic", "eat", "use_healing_item", "attack_nearest", "escape", "follow_player", "select_hotbar", "open_inventory", "use_block", "place_block", "chat_say", "complete_goal", "wait", "observe", "remember", "learn_skill");
+                case "world" -> Set.of("move_to", "harvest_block", "collect_resource", "collect_nearby", "craft_basic", "craft_workbench", "forage_food", "eat", "use_healing_item", "attack_nearest", "escape", "follow_player", "select_hotbar", "open_inventory", "use_block", "place_block", "chat_say", "complete_goal", "wait", "observe", "remember", "learn_skill");
                 case "menu" -> Set.of("ui_click_slot", "ui_click_chat", "ui_input_chat", "ui_widget", "ui_close", "inspect_slot", "chat_say", "observe", "complete_goal", "remember", "learn_skill");
                 default -> null;
             };
